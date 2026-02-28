@@ -22,8 +22,16 @@ import numpy as np
 TARGET_FPS: int = 60
 """Target capture/display framerate."""
 
+MONITOR_INDEX: int = 0
+"""
+Monitor / DXGI output index.
+  0 = primary monitor
+  1 = secondary monitor
+Run with --list (or check your display settings) to confirm which is which.
+"""
+
 # ROI: tuple[int, int, int, int] | None = None
-ROI = (378, 127, 1542, 1019)
+ROI: tuple[int, int, int, int]  = (378, 127, 1542, 1019)
 """
 Screen region to capture as (left, top, right, bottom) in pixel coordinates.
 Set to None to capture the entire primary monitor.
@@ -71,7 +79,7 @@ def create_camera(target_fps: int, roi: tuple | None) -> dxcam.DXCamera:
     dxcam internally runs a capture thread with a small ring buffer.
     We use output_color="BGR" to avoid a per-frame BGRA→BGR conversion.
     """
-    cam = dxcam.create(output_color="BGR")
+    cam = dxcam.create(output_idx=MONITOR_INDEX, output_color="BGR")
     if cam is None:
         print("[ERROR] dxcam.create() returned None. Check GPU/driver compatibility.")
         sys.exit(1)

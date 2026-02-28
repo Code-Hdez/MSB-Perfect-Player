@@ -69,3 +69,7 @@ desktop.ini
 # Keep chat context files out of the repo
 gemini chat.txt
 gpt chat.txt
+
+# MSB dataset & pitch recordings
+dataset/
+pitches/
