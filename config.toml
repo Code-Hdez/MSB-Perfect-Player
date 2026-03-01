@@ -1,0 +1,77 @@
+# Ball Tracking Configuration
+
+# Copy and modify this file.  CLI overrides take precedence.
+# All coordinates are in ROI-relative pixels unless stated otherwise.
+
+[capture]
+screen_roi      = [378, 127, 1542, 1019]   # (left, top, right, bottom) Dolphin window
+monitor_index   = 0
+target_fps      = 60
+
+[detection]
+# HSV thresholds — ball (bright / low saturation)
+ball_hsv_lower  = [0, 0, 140]
+ball_hsv_upper  = [180, 80, 255]
+# Trail detection — dimmer, motion-blurred ball
+trail_hsv_lower = [0, 0, 100]
+trail_hsv_upper = [180, 100, 255]
+
+# Contour filtering
+ball_min_area           = 6
+ball_max_area           = 500
+ball_flight_max_area    = 300
+ball_min_circularity    = 0.15
+
+# Background model
+bg_alpha            = 0.02
+bg_warmup_frames    = 25
+bg_fg_threshold     = 25
+
+# Frame differencing (fallback / secondary)
+diff_threshold      = 25
+diff_dilate_iter    = 2
+
+# Pitcher-body suppression
+pitcher_body_min_area   = 200
+isolation_zone_scale    = 0.6
+isolation_inner         = 0.5
+isolation_outer         = 2.0
+
+# Static-element suppression
+static_cell_size        = 12
+static_hit_threshold    = 3
+
+[corridor]
+corridor_default        = [380, 80, 820, 900]   # (x1, y1, x2, y2) in ROI coords
+corridor_margin         = 50
+corridor_penalty_dist   = 60.0
+
+[tracker]
+track_max_dist_min      = 50.0
+track_max_dist_speed_k  = 3.0
+track_gap_expand        = 0.35
+track_lost_frames       = 8
+track_tentative_lost    = 5
+trajectory_history      = 60
+track_min_confirmations = 4
+track_size_ratio        = 5.0
+min_pitch_vy            = 3.0
+max_pitcher_zone_frames = 15
+min_departure_dist      = 60.0
+max_vy_sign_changes     = 2
+
+# Kalman filter
+kf_process_noise        = 16.0
+kf_measurement_noise    = 4.0
+
+[zones]
+pitcher_zone    = [520, 80, 680, 260]
+reacq_zone      = [480, 180, 710, 600]
+reacq_window    = 30
+
+[recording]
+record_max_frames   = 120
+pitches_dir         = "./pitches"
+
+[display]
+display_scale   = 0.85
