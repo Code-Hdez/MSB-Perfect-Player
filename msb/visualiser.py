@@ -12,6 +12,7 @@ import numpy as np
 from msb.config import Config
 from msb.detector import BallCandidate, BallDetector
 from msb.tracker import BallTrack, BallTracker, TrackState
+from msb.tracker_ml import MLTrackState
 from msb.predictor import TrajectoryPredictor
 from msb.corridor import TrajectoryCorridor
 from msb.utils import (
@@ -72,14 +73,18 @@ class PitchVisualiser:
             col = COL_YELLOW if c.in_motion_mask else (128, 128, 128)
             cv2.circle(vis, c.center, 3, col, -1)
 
-        # Track state label
+        # Track state label (supports both classical TrackState and MLTrackState)
         state_label = tracker.state.name
-        state_col = {
+        _state_colors = {
             TrackState.IDLE: COL_WHITE,
             TrackState.TENTATIVE: COL_ORANGE,
             TrackState.CONFIRMED: COL_GREEN,
             TrackState.LOST: COL_RED,
-        }.get(tracker.state, COL_WHITE)
+            MLTrackState.IDLE: COL_WHITE,
+            MLTrackState.ACTIVE: COL_GREEN,
+            MLTrackState.LOST: COL_RED,
+        }
+        state_col = _state_colors.get(tracker.state, COL_WHITE)
         put_text(vis, f"STATE: {state_label}", (10, 40), 0.45,
                  state_col, 1)
         put_text(vis, f"BG: {'ready' if detector.bg_model.ready else 'warming'}",

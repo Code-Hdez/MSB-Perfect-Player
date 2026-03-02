@@ -1,0 +1,25 @@
+# MSB-Perfect-Player — runtime dependencies
+# Install: pip install -r requirements.txt
+#
+# Core (always required):
+numpy
+opencv-python
+dxcam                   # Windows screen capture @ 60 Hz (preferred)
+mss                     # Fallback screen capture (if dxcam fails)
+
+# ROI tool (find_roi.py):
+pynput
+
+# ML ball detector (--model flag):
+ultralytics
+
+# PyTorch with CUDA (GPU inference — much faster):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# PyTorch CPU-only (if no NVIDIA GPU):
+#   pip install torch torchvision
+
+# Optional – ONNX-only inference (lighter, no ultralytics needed):
+#   pip install onnxruntime-gpu
+
+# Optional – TOML config on Python < 3.11:
+# tomli

@@ -1,24 +1,22 @@
 """
-Validate Tracking — Compare tracker output against manual annotations.
+validate_tracking.py — Evaluate ball tracking against ground-truth annotations.
 
-Loads manual annotations (from frame_annotator.py) and runs the detection
-+ tracking pipeline on the same recorded frames.  Computes per-frame
-pixel error and reports summary statistics.
+Compares tracker predictions against manually annotated ball positions
+and reports detection accuracy metrics.
 
-Optionally renders a debug video or image sequence showing:
-  - All candidates (yellow/grey dots)
-  - Chosen track point (green circle)
-  - Annotation ground truth (red crosshair)
-  - Error line connecting them
-  - Track state label
-  - Suppression zones
+Usage examples
+--------------
+  # Classical detector:
+  python validate_tracking.py pitches/20260301_030216
 
-Usage
------
-  python validate_tracking.py pitches/20260227_205241
-  python validate_tracking.py pitches/20260227_205241 -a annotations.json
-  python validate_tracking.py pitches/20260227_205241 --debug-video debug.mp4
-  python validate_tracking.py pitches/20260227_205241 --debug-frames debug_out/
+  # ML detector:
+  python validate_tracking.py pitches/20260301_030216 --model weights/ball_best.pt
+
+  # Custom annotations file:
+  python validate_tracking.py pitches/20260301_030216 -a my_annotations.json
+
+  # Generate debug video with GT overlay:
+  python validate_tracking.py pitches/20260301_030216 --model weights/ball_best.pt --debug-video val_debug.mp4
 """
 
 from __future__ import annotations
@@ -32,344 +30,359 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from msb import Config, BallDetector, BallTracker, TrajectoryCorridor, TrackState
+from msb.config import Config
+from msb.detector import BallDetector, BallCandidate
+from msb.tracker import BallTracker, TrackState
+from msb.predictor import TrajectoryPredictor
+from msb.corridor import TrajectoryCorridor
+from msb.visualiser import PitchVisualiser
 from msb.detector_ml import MLBallDetector
 from msb.tracker_ml import MLBallTracker, MLTrackState
-from msb.utils import (
-    COL_GREEN, COL_RED, COL_YELLOW, COL_CYAN, COL_WHITE,
-    COL_ORANGE, COL_MAGENTA, COL_BLACK, FONT, put_text,
-)
+from msb.utils import put_text, COL_GREEN, COL_RED, COL_YELLOW, COL_MAGENTA
 
 
-def load_annotations(path: Path) -> Dict[str, Dict[str, Any]]:
-    """Load annotations JSON and return the annotations dict."""
-    with open(path) as f:
-        data = json.load(f)
-    return data.get("annotations", {})
+# Metrics
 
-
-def load_frames(folder: Path) -> List[Path]:
-    exts = {".png", ".jpg", ".jpeg", ".bmp"}
-    files = sorted(f for f in folder.iterdir() if f.suffix.lower() in exts)
-    return files
-
-
-def run_validation(
-    folder: Path,
-    annotations: Dict[str, Dict[str, Any]],
-    cfg: Config,
-    model_path: Optional[str] = None,
-    corridor_path: Optional[Path] = None,
-    debug_video: Optional[Path] = None,
-    debug_frames_dir: Optional[Path] = None,
+def compute_metrics(
+    predictions: Dict[int, Tuple[int, int]],
+    ground_truth: Dict[int, Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Run the full tracker on recorded frames, compare with annotations.
+    """Compute tracking quality metrics.
 
-    Returns a dict of metrics.
+    Parameters
+    ----------
+    predictions : dict
+        {frame_idx: (x, y)} for frames where the tracker reported a position.
+    ground_truth : dict
+        {frame_idx: {"x": int, "y": int, "visible": bool}} from annotations.
+
+    Returns
+    -------
+    dict with metric fields.
     """
-    files = load_frames(folder)
-    if not files:
-        print(f"[ERROR] No frames in {folder}")
-        return {}
-
-    n_frames = len(files)
-    print(f"[INFO] {n_frames} frames, {len(annotations)} annotations")
-
-    # Set up pipeline
-    use_ml = model_path is not None
-    if use_ml:
-        detector = MLBallDetector(model_path, conf=0.25, imgsz=960, cfg=cfg)
-        tracker = MLBallTracker(cfg=cfg)
-        print(f"[INFO] Using ML detector: {model_path}")
-    else:
-        detector = BallDetector(cfg)
-        tracker = BallTracker(cfg)
-        print("[INFO] Using classical detector")
-    corridor = TrajectoryCorridor(cfg)
-    if corridor_path and corridor_path.exists():
-        corridor.load(corridor_path)
-    elif cfg.corridor_default:
-        corridor.set_rect(*cfg.corridor_default)
-
-    # Video writer
-    writer: Optional[cv2.VideoWriter] = None
-    if debug_frames_dir:
-        debug_frames_dir.mkdir(parents=True, exist_ok=True)
-
-    # Per-frame results
-    errors: List[Optional[float]] = []
-    tracker_detected: List[bool] = []
-    ann_visible: List[bool] = []
-    false_starts: int = 0
-    track_swaps: int = 0
-    dropouts: int = 0
-
-    prev_track_state = TrackState.IDLE if not use_ml else MLTrackState.IDLE
-    was_tracking = False
-
-    for i, fpath in enumerate(files):
-        frame = cv2.imread(str(fpath))
-        if frame is None:
-            errors.append(None)
-            tracker_detected.append(False)
-            ann_visible.append(False)
-            continue
-
-        key = str(i)
-        ann = annotations.get(key)
-        gt_visible = ann is not None and ann.get("visible", False)
-        gt_pos: Optional[Tuple[int, int]] = None
-        if gt_visible:
-            gt_pos = (ann["x"], ann["y"])
-
-        ann_visible.append(gt_visible)
-
-        # Run pipeline
-        track_active = (
-            tracker.track is not None
-            and tracker.track.active
-            and tracker.track.confirmed
-        )
-        best = detector.detect(frame, corridor=corridor,
-                               track_active=track_active)
-        track = tracker.update(detector.candidates, best)
-
-        sel = tracker.selected
-        tracker_pos: Optional[Tuple[int, int]] = None
-        if sel is not None:
-            tracker_pos = sel.center
-            tracker_detected.append(True)
-        else:
-            tracker_detected.append(False)
-
-        # Compute error
-        if gt_visible and tracker_pos is not None:
-            err = np.hypot(tracker_pos[0] - gt_pos[0],
-                           tracker_pos[1] - gt_pos[1])
-            errors.append(float(err))
-        elif gt_visible and tracker_pos is None:
-            errors.append(None)  # missed detection
-        else:
-            errors.append(None)
-
-        # Track lifecycle events
-        cur_state = tracker.state
-        if use_ml:
-            # ML tracker: IDLE → ACTIVE → LOST
-            if (prev_track_state == MLTrackState.IDLE
-                    and cur_state == MLTrackState.ACTIVE):
-                if not gt_visible:
-                    false_starts += 1
-            if (prev_track_state == MLTrackState.ACTIVE
-                    and cur_state == MLTrackState.LOST):
-                if gt_visible:
-                    dropouts += 1
-        else:
-            # Classical tracker: IDLE → TENTATIVE → CONFIRMED → LOST
-            if (prev_track_state == TrackState.IDLE
-                    and cur_state == TrackState.TENTATIVE):
-                if not gt_visible:
-                    false_starts += 1
-            if (prev_track_state in (TrackState.CONFIRMED, TrackState.TENTATIVE)
-                    and cur_state == TrackState.LOST):
-                if gt_visible:
-                    dropouts += 1
-        prev_track_state = cur_state
-
-        # Debug visualisation
-        if debug_video is not None or debug_frames_dir is not None:
-            vis = frame.copy()
-            h, w = vis.shape[:2]
-
-            # Pitcher zone
-            pz = cfg.pitcher_zone
-            cv2.rectangle(vis, (pz[0], pz[1]), (pz[2], pz[3]),
-                          (128, 128, 0), 1)
-
-            # Corridor
-            corridor.draw(vis, COL_CYAN, 1)
-
-            # Suppression zones
-            for sx, sy, sr in detector.suppressor.suppression_zones:
-                cv2.circle(vis, (sx, sy), sr, (0, 0, 128), 1)
-
-            # All candidates
-            for c in detector.candidates:
-                col = COL_YELLOW if c.in_motion_mask else (100, 100, 100)
-                cv2.circle(vis, c.center, 3, col, -1)
-
-            # Tracker pick
-            if tracker_pos is not None:
-                cv2.circle(vis, tracker_pos, 10, COL_GREEN, 2)
-                cv2.circle(vis, tracker_pos, 2, COL_RED, -1)
-
-            # Ground truth
-            if gt_pos is not None:
-                cv2.drawMarker(vis, gt_pos, COL_RED,
-                               cv2.MARKER_CROSS, 18, 2)
-                cv2.circle(vis, gt_pos, 6, COL_RED, 1)
-
-            # Error line
-            if gt_pos is not None and tracker_pos is not None:
-                cv2.line(vis, tracker_pos, gt_pos, COL_MAGENTA, 1)
-                err_val = errors[-1]
-                if err_val is not None:
-                    mid = ((tracker_pos[0] + gt_pos[0]) // 2,
-                           (tracker_pos[1] + gt_pos[1]) // 2)
-                    put_text(vis, f"{err_val:.1f}px",
-                             (mid[0] + 5, mid[1] - 5), 0.35,
-                             COL_MAGENTA, 1)
-
-            # State / frame info
-            state_label = tracker.state.name
-            put_text(vis, f"Frame {i}  [{state_label}]",
-                     (10, 22), 0.45, COL_WHITE, 1)
-
-            if gt_visible and tracker_pos is None:
-                put_text(vis, "MISSED", (10, 44), 0.50, COL_RED, 2)
-
-            # Write
-            if debug_video is not None:
-                if writer is None:
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    writer = cv2.VideoWriter(
-                        str(debug_video), fourcc, 30, (w, h))
-                writer.write(vis)
-
-            if debug_frames_dir is not None:
-                out_path = debug_frames_dir / f"debug_{i:04d}.png"
-                cv2.imwrite(str(out_path), vis)
-
-    if writer is not None:
-        writer.release()
-        print(f"[INFO] Debug video saved: {debug_video}")
-    if debug_frames_dir is not None:
-        print(f"[INFO] Debug frames saved: {debug_frames_dir}")
-
-    # Compute metrics
-    gt_visible_indices = [i for i in range(n_frames) if ann_visible[i]]
-    n_visible = len(gt_visible_indices)
-
-    valid_errors = [errors[i] for i in gt_visible_indices
-                    if errors[i] is not None]
-    missed_count = sum(1 for i in gt_visible_indices
-                       if errors[i] is None)
-    detected_count = len(valid_errors)
-
-    metrics: Dict[str, Any] = {
-        "total_frames": n_frames,
-        "annotated_visible": n_visible,
-        "detected_when_visible": detected_count,
-        "missed_when_visible": missed_count,
-        "detection_rate": (detected_count / n_visible * 100
-                           if n_visible > 0 else 0.0),
-        "false_starts": false_starts,
-        "dropouts": dropouts,
+    gt_visible = {
+        int(k): v for k, v in ground_truth.items()
+        if v.get("visible", False)
+    }
+    gt_not_visible = {
+        int(k): v for k, v in ground_truth.items()
+        if not v.get("visible", False)
     }
 
-    if valid_errors:
-        arr = np.array(valid_errors)
-        metrics["mean_error_px"] = float(np.mean(arr))
-        metrics["median_error_px"] = float(np.median(arr))
-        metrics["max_error_px"] = float(np.max(arr))
-        metrics["std_error_px"] = float(np.std(arr))
-        metrics["p90_error_px"] = float(np.percentile(arr, 90))
-        metrics["within_5px"] = float(np.mean(arr <= 5) * 100)
-        metrics["within_10px"] = float(np.mean(arr <= 10) * 100)
-        metrics["within_20px"] = float(np.mean(arr <= 20) * 100)
-    else:
-        metrics["mean_error_px"] = None
-        metrics["median_error_px"] = None
-        metrics["max_error_px"] = None
+    # True positives: predicted AND visible in GT
+    errors: List[float] = []
+    true_positives = 0
+    for fidx, gt in gt_visible.items():
+        if fidx in predictions:
+            px, py = predictions[fidx]
+            err = float(np.hypot(px - gt["x"], py - gt["y"]))
+            errors.append(err)
+            true_positives += 1
 
-    # Per-frame detail
-    metrics["per_frame"] = []
-    for i in range(n_frames):
-        entry: Dict[str, Any] = {"frame": i}
-        if ann_visible[i]:
-            entry["gt_visible"] = True
-            entry["tracker_detected"] = tracker_detected[i]
-            entry["error_px"] = errors[i]
-        else:
-            entry["gt_visible"] = False
-        metrics["per_frame"].append(entry)
+    # Missed: visible in GT but not predicted
+    missed = len(gt_visible) - true_positives
+
+    # False positives: predicted but NOT visible in GT
+    false_positives = 0
+    for fidx in predictions:
+        if fidx in gt_not_visible:
+            false_positives += 1
+
+    # False starts: predicted before ball is visible in GT
+    gt_first_visible = min(gt_visible.keys()) if gt_visible else None
+    false_starts = 0
+    if gt_first_visible is not None:
+        for fidx in predictions:
+            if fidx < gt_first_visible:
+                false_starts += 1
+
+    # Dropouts: gaps in continuous tracking during visible window
+    dropouts = 0
+    if gt_visible:
+        vis_frames = sorted(gt_visible.keys())
+        tracking = False
+        for fidx in range(vis_frames[0], vis_frames[-1] + 1):
+            if fidx in predictions:
+                tracking = True
+            elif tracking and fidx in gt_visible:
+                dropouts += 1
+                tracking = False
+
+    # Continuity: longest consecutive tracked run within visible window
+    max_run = 0
+    current_run = 0
+    if gt_visible:
+        vis_frames = sorted(gt_visible.keys())
+        for fidx in range(vis_frames[0], vis_frames[-1] + 1):
+            if fidx in predictions:
+                current_run += 1
+                max_run = max(max_run, current_run)
+            else:
+                current_run = 0
+
+    err_arr = np.array(errors) if errors else np.array([])
+
+    detection_rate = (true_positives / len(gt_visible) * 100
+                      if gt_visible else 0.0)
+
+    metrics: Dict[str, Any] = {
+        "total_gt_visible": len(gt_visible),
+        "total_gt_not_visible": len(gt_not_visible),
+        "total_predicted": len(predictions),
+        "true_positives": true_positives,
+        "missed": missed,
+        "false_positives": false_positives,
+        "false_starts": false_starts,
+        "dropouts": dropouts,
+        "detection_rate_pct": round(detection_rate, 2),
+        "longest_continuous_run": max_run,
+    }
+
+    if len(err_arr) > 0:
+        metrics.update({
+            "mean_error_px": round(float(np.mean(err_arr)), 2),
+            "median_error_px": round(float(np.median(err_arr)), 2),
+            "max_error_px": round(float(np.max(err_arr)), 2),
+            "std_error_px": round(float(np.std(err_arr)), 2),
+            "within_5px_pct": round(float(np.mean(err_arr <= 5) * 100), 2),
+            "within_10px_pct": round(float(np.mean(err_arr <= 10) * 100), 2),
+            "within_20px_pct": round(float(np.mean(err_arr <= 20) * 100), 2),
+        })
+    else:
+        metrics.update({
+            "mean_error_px": None,
+            "median_error_px": None,
+            "max_error_px": None,
+            "std_error_px": None,
+            "within_5px_pct": None,
+            "within_10px_pct": None,
+            "within_20px_pct": None,
+        })
 
     return metrics
 
 
-def print_report(metrics: Dict[str, Any]) -> None:
-    """Print a human-readable summary of validation results."""
-    print("\n" + "=" * 60)
-    print("  TRACKING VALIDATION REPORT")
-    print("=" * 60)
-
-    print(f"\n  Total frames:           {metrics['total_frames']}")
-    print(f"  Annotated (visible):    {metrics['annotated_visible']}")
-    print(f"  Detected when visible:  {metrics['detected_when_visible']}")
-    print(f"  Missed when visible:    {metrics['missed_when_visible']}")
-    print(f"  Detection rate:         {metrics['detection_rate']:.1f}%")
-    print(f"  False starts:           {metrics['false_starts']}")
-    print(f"  Track dropouts:         {metrics['dropouts']}")
-
-    if metrics.get("mean_error_px") is not None:
-        print(f"\n  Mean error:             {metrics['mean_error_px']:.1f} px")
-        print(f"  Median error:           {metrics['median_error_px']:.1f} px")
-        print(f"  Max error:              {metrics['max_error_px']:.1f} px")
-        print(f"  Std deviation:          {metrics['std_error_px']:.1f} px")
-        print(f"  90th percentile:        {metrics['p90_error_px']:.1f} px")
-        print(f"  Within  5 px:           {metrics['within_5px']:.1f}%")
-        print(f"  Within 10 px:           {metrics['within_10px']:.1f}%")
-        print(f"  Within 20 px:           {metrics['within_20px']:.1f}%")
+def print_metrics(metrics: Dict[str, Any]) -> None:
+    """Pretty-print validation metrics to stdout."""
+    print("\n" + "=" * 55)
+    print("  VALIDATION METRICS")
+    print("=" * 55)
+    print(f"  GT visible frames:     {metrics['total_gt_visible']}")
+    print(f"  GT not-visible frames: {metrics['total_gt_not_visible']}")
+    print(f"  Predicted frames:      {metrics['total_predicted']}")
+    print(f"  True positives:        {metrics['true_positives']}")
+    print(f"  Missed:                {metrics['missed']}")
+    print(f"  False positives:       {metrics['false_positives']}")
+    print(f"  False starts:          {metrics['false_starts']}")
+    print(f"  Dropouts:              {metrics['dropouts']}")
+    print(f"  Detection rate:        {metrics['detection_rate_pct']:.1f}%")
+    print(f"  Longest run:           {metrics['longest_continuous_run']} frames")
+    print("-" * 55)
+    if metrics["mean_error_px"] is not None:
+        print(f"  Mean error:            {metrics['mean_error_px']:.2f} px")
+        print(f"  Median error:          {metrics['median_error_px']:.2f} px")
+        print(f"  Max error:             {metrics['max_error_px']:.2f} px")
+        print(f"  Std error:             {metrics['std_error_px']:.2f} px")
+        print(f"  Within  5px:           {metrics['within_5px_pct']:.1f}%")
+        print(f"  Within 10px:           {metrics['within_10px_pct']:.1f}%")
+        print(f"  Within 20px:           {metrics['within_20px_pct']:.1f}%")
     else:
-        print("\n  [No valid error measurements — "
-              "no frames with both annotation and detection]")
-
-    print("\n" + "=" * 60)
+        print("  (no overlapping detections to compute error)")
+    print("=" * 55)
 
     # Quality assessment
-    rate = metrics["detection_rate"]
-    mean_err = metrics.get("mean_error_px")
-    fs = metrics["false_starts"]
-
-    print("\n  ASSESSMENT:")
-    issues = []
-    if rate < 80:
-        issues.append(f"  - Detection rate ({rate:.1f}%) is below 80% target")
-    if mean_err is not None and mean_err > 15:
-        issues.append(f"  - Mean error ({mean_err:.1f}px) exceeds 15px target")
-    if fs > 0:
-        issues.append(f"  - {fs} false start(s) detected (should be 0)")
-    if metrics["dropouts"] > 1:
-        issues.append(f"  - {metrics['dropouts']} track dropout(s)")
-
-    if not issues:
-        print("  PASS — Tracking meets quality targets")
+    dr = metrics["detection_rate_pct"]
+    mean_e = metrics["mean_error_px"]
+    print("\n  QUALITY ASSESSMENT:")
+    if dr >= 90 and mean_e is not None and mean_e <= 10:
+        print("  ** EXCELLENT — ready for real-time use")
+    elif dr >= 75 and mean_e is not None and mean_e <= 20:
+        print("  * GOOD — usable, minor improvements possible")
+    elif dr >= 50:
+        print("  ~ FAIR — needs more training data or tuning")
     else:
-        print("  NEEDS IMPROVEMENT:")
-        for issue in issues:
-            print(issue)
-
+        print("  ! POOR — significant issues, review pipeline")
     print()
 
 
-def main():
+# Tracking run
+
+def run_validation(
+    folder: Path,
+    cfg: Config,
+    model_path: Optional[str] = None,
+    conf: float = 0.25,
+    imgsz: int = 960,
+    annotations_path: Optional[Path] = None,
+    debug_video: Optional[Path] = None,
+    debug_frames_dir: Optional[Path] = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Run tracker on frames and compare to annotations."""
+
+    # Load frames
+    exts = {".png", ".jpg", ".jpeg", ".bmp"}
+    files = sorted(f for f in folder.iterdir() if f.suffix.lower() in exts)
+    if not files:
+        print(f"[ERROR] No image files in {folder}")
+        return {}
+
+    # Load annotations
+    ann_path = annotations_path or (folder / "annotations.json")
+    if not ann_path.exists():
+        print(f"[ERROR] Annotations not found: {ann_path}")
+        print("  Run frame_annotator.py first to create annotations.")
+        return {}
+
+    with open(ann_path) as f:
+        ann_data = json.load(f)
+    ground_truth = ann_data.get("annotations", {})
+    if verbose:
+        n_vis = sum(1 for v in ground_truth.values() if v.get("visible"))
+        print(f"[INFO] {len(files)} frames, {len(ground_truth)} annotations "
+              f"({n_vis} visible)")
+
+    # Setup pipeline
+    use_ml = model_path is not None
+    if use_ml:
+        detector = MLBallDetector(model_path, conf=conf, imgsz=imgsz, cfg=cfg)
+        tracker = MLBallTracker(cfg=cfg)
+        if verbose:
+            print(f"[INFO] Using ML detector: {model_path} "
+                  f"(conf={conf}, imgsz={imgsz})")
+    else:
+        detector = BallDetector(cfg)
+        tracker = BallTracker(cfg)
+        if verbose:
+            print("[INFO] Using classical detector")
+
+    corridor = TrajectoryCorridor(cfg)
+    if cfg.corridor_default is not None:
+        corridor.set_rect(*cfg.corridor_default)
+
+    vis = PitchVisualiser()
+
+    # Debug output
+    writer: Optional[cv2.VideoWriter] = None
+    if debug_frames_dir:
+        debug_frames_dir.mkdir(parents=True, exist_ok=True)
+
+    # Run tracking
+    predictions: Dict[int, Tuple[int, int]] = {}
+
+    for i, fpath in enumerate(files):
+        frame = cv2.imread(str(fpath))
+        if frame is None:
+            continue
+
+        track_active = (tracker.track is not None
+                        and tracker.track.active
+                        and tracker.track.confirmed)
+        best = detector.detect(frame, corridor=corridor,
+                               track_active=track_active)
+        track = tracker.update(detector.candidates, best, detector=detector)
+
+        sel = tracker.selected
+        if sel is not None:
+            predictions[i] = sel.center
+        elif best is not None and not use_ml:
+            # For classical, include untracked best as fallback
+            pass
+
+        # Debug output
+        if debug_video is not None or debug_frames_dir is not None:
+            dvis = frame.copy()
+
+            # Draw tracker overlay
+            dvis = vis.overlay(frame, detector, tracker,
+                               TrajectoryPredictor(cfg=cfg),
+                               corridor, None, False, 0.0, i, cfg=cfg)
+
+            # Draw ground truth
+            gt = ground_truth.get(str(i))
+            if gt and gt.get("visible"):
+                gx, gy = gt["x"], gt["y"]
+                cv2.drawMarker(dvis, (gx, gy), COL_RED,
+                               cv2.MARKER_CROSS, 20, 2)
+                cv2.circle(dvis, (gx, gy), 8, COL_RED, 1)
+                put_text(dvis, "GT", (gx + 10, gy - 10), 0.4, COL_RED, 1)
+
+                if sel is not None:
+                    cv2.line(dvis, sel.center, (gx, gy), COL_MAGENTA, 1)
+                    err = np.hypot(sel.center[0] - gx, sel.center[1] - gy)
+                    mid = ((sel.center[0] + gx) // 2,
+                           (sel.center[1] + gy) // 2)
+                    put_text(dvis, f"{err:.1f}px",
+                             (mid[0] + 5, mid[1] - 5), 0.35,
+                             COL_MAGENTA, 1)
+
+            # State label
+            state_name = tracker.state.name
+            put_text(dvis, f"F{i:03d} [{state_name}]",
+                     (10, 25), 0.5, COL_YELLOW, 1)
+
+            h, w = dvis.shape[:2]
+            if debug_video is not None and writer is None:
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(str(debug_video), fourcc, 30, (w, h))
+            if writer is not None:
+                writer.write(dvis)
+            if debug_frames_dir is not None:
+                cv2.imwrite(str(debug_frames_dir / f"val_{i:04d}.png"), dvis)
+
+        if verbose:
+            gt = ground_truth.get(str(i))
+            gt_str = ""
+            if gt and gt.get("visible"):
+                gt_str = f" GT=({gt['x']},{gt['y']})"
+            if sel is not None:
+                print(f"  F{i:03d}: tracked ({sel.center[0]:4d},"
+                      f"{sel.center[1]:4d}){gt_str}")
+            elif gt and gt.get("visible"):
+                print(f"  F{i:03d}: MISSED{gt_str}")
+
+    if writer is not None:
+        writer.release()
+        if verbose:
+            print(f"[INFO] Debug video saved: {debug_video}")
+
+    # Compute metrics
+    metrics = compute_metrics(predictions, ground_truth)
+
+    return {
+        "folder": str(folder),
+        "annotations_file": str(ann_path),
+        "model": model_path or "classical",
+        "metrics": metrics,
+        "predictions": {str(k): list(v) for k, v in predictions.items()},
+    }
+
+
+# CLI
+
+def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Validate tracking pipeline against manual annotations")
+        description="Validate ball tracking against ground-truth annotations")
     ap.add_argument("folder",
                     help="Path to pitch recording folder")
     ap.add_argument("-a", "--annotations", default=None,
-                    help="Path to annotations JSON "
-                    "(default: <folder>/annotations.json)")
-    ap.add_argument("--corridor", default=None,
-                    help="Path to corridor JSON")
+                    help="Annotations JSON (default: <folder>/annotations.json)")
+    ap.add_argument("-c", "--config", default=None,
+                    help="Config file (TOML or JSON)")
+    ap.add_argument("--model", "-m", default=None,
+                    help="YOLO .pt or .onnx model for ML detection")
+    ap.add_argument("--conf", type=float, default=0.25,
+                    help="ML detector confidence threshold (default: 0.25)")
+    ap.add_argument("--imgsz", type=int, default=960,
+                    help="ML detector inference resolution (default: 960)")
     ap.add_argument("--debug-video", default=None,
-                    help="Output path for debug video (e.g. debug.mp4)")
+                    help="Output debug video path (e.g. val_debug.mp4)")
     ap.add_argument("--debug-frames", default=None,
                     help="Output folder for per-frame debug images")
-    ap.add_argument("--save-metrics", default=None,
-                    help="Save metrics JSON to this path")
-    ap.add_argument("-c", "--config", default=None,
-                    help="Path to config file (TOML or JSON)")
+    ap.add_argument("-o", "--output", default=None,
+                    help="Save results JSON to this path")
+    ap.add_argument("-q", "--quiet", action="store_true",
+                    help="Suppress per-frame output")
     args = ap.parse_args()
 
     folder = Path(args.folder)
@@ -384,38 +397,26 @@ def main():
         cfg_path = Path("config.toml")
         cfg = Config.load(str(cfg_path)) if cfg_path.exists() else Config()
 
-    ann_path = (Path(args.annotations)
-                if args.annotations else folder / "annotations.json")
-    if not ann_path.exists():
-        print(f"[ERROR] Annotations not found: {ann_path}")
-        print("  Run frame_annotator.py first to create annotations.")
-        sys.exit(1)
-
-    annotations = load_annotations(ann_path)
-    if not annotations:
-        print("[ERROR] No annotations in file")
-        sys.exit(1)
-
-    corridor_path = Path(args.corridor) if args.corridor else None
-    debug_video = Path(args.debug_video) if args.debug_video else None
-    debug_frames_dir = Path(args.debug_frames) if args.debug_frames else None
-
-    metrics = run_validation(
-        folder, annotations, cfg,
+    results = run_validation(
+        folder, cfg,
         model_path=args.model,
-        corridor_path=corridor_path,
-        debug_video=debug_video,
-        debug_frames_dir=debug_frames_dir,
+        conf=args.conf,
+        imgsz=args.imgsz,
+        annotations_path=Path(args.annotations) if args.annotations else None,
+        debug_video=Path(args.debug_video) if args.debug_video else None,
+        debug_frames_dir=Path(args.debug_frames) if args.debug_frames else None,
+        verbose=not args.quiet,
     )
 
-    print_report(metrics)
+    if not results:
+        sys.exit(1)
 
-    if args.save_metrics:
-        # Remove per_frame detail for the saved version (too large)
-        save_data = {k: v for k, v in metrics.items() if k != "per_frame"}
-        with open(args.save_metrics, "w") as f:
-            json.dump(save_data, f, indent=2)
-        print(f"[INFO] Metrics saved to {args.save_metrics}")
+    print_metrics(results["metrics"])
+
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"[INFO] Results saved to {args.output}")
 
 
 if __name__ == "__main__":

@@ -1,31 +1,27 @@
 """
-Frame Annotator — Human-in-the-loop ball annotation tool
+frame_annotator.py — Interactively annotate ball positions in pitch frames.
 
-Load recorded pitch frames, step through them, click to tag the ball
-centre, mark frames where the ball is not visible, and save annotations
-to JSON.  Optionally overlays the algorithm's detector/tracker output so
-a human can quickly correct labels.
+Click to mark the ball center in each frame. Press [N] to mark "not visible".
+Saves annotations in a deterministic JSON schema compatible with
+export_yolo.py and validate_tracking.py.
 
 Usage
 -----
-  python frame_annotator.py pitches/20260227_205241
-  python frame_annotator.py pitches/20260227_205241 --annotations annot.json
-  python frame_annotator.py pitches/20260227_205241 --auto-detect
+  python frame_annotator.py pitches/20260301_030216
+  python frame_annotator.py pitches/20260301_030216 -o custom_annotations.json
 
 Controls
 --------
-  Right / D           Next frame
-  Left  / A           Previous frame
-  Space               Play / Pause (auto-advance)
-  Home                Jump to first frame
-  End                 Jump to last frame
-  G                   Go to frame number (type in terminal)
-  Left-click          Tag ball centre at cursor position
-  V                   Mark ball as NOT visible in this frame
-  Delete / Backspace  Remove annotation for this frame
-  T                   Toggle algorithm detector overlay
-  S                   Save annotations to JSON
-  Q / ESC             Quit (prompts to save if unsaved changes)
+  Left-click = Mark ball center at cursor position
+  N          = Mark ball as NOT visible in this frame
+  B / Left   = Go back one frame (undo last annotation for review)
+  S          = Save annotations to disk (auto-saves on completion)
+  Q / ESC    = Quit (prompts to save if unsaved changes)
+  R          = Remove annotation for current frame and re-annotate
+
+Schema (annotations.json)
+-------------------------
+See docs/annotations_schema.md for the full specification.
 """
 
 from __future__ import annotations
@@ -33,438 +29,242 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-# Import from the msb package
-try:
-    from msb import (
-        Config, BallDetector, BallTracker, BallCandidate,
-        TrajectoryCorridor,
-    )
-    from msb.utils import (
-        COL_GREEN, COL_RED, COL_YELLOW, COL_CYAN, COL_WHITE,
-        COL_ORANGE, COL_MAGENTA, COL_BLACK, FONT, put_text,
-    )
-    _HAS_DETECTOR = True
-except ImportError:
-    _HAS_DETECTOR = False
-
 WINDOW_NAME = "MSB Frame Annotator"
-
-# Annotation schema
-
-# {
-#   "pitch_folder": "pitches/...",
-#   "n_frames": 120,
-#   "annotator": "human",
-#   "created": "2026-02-28T...",
-#   "annotations": {
-#       "55": {"x": 595, "y": 170, "visible": true},
-#       "89": {"visible": false},
-#       ...
-#   }
-# }
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
-class Annotator:
-    """Interactive frame annotation tool with OpenCV GUI."""
+class FrameAnnotator:
+    """Interactive frame-by-frame ball position annotator."""
 
-    def __init__(self, folder: Path, annotation_path: Optional[Path],
-                 auto_detect: bool = False,
-                 cfg: Optional[Config] = None) -> None:
+    def __init__(
+        self,
+        folder: Path,
+        output_path: Optional[Path] = None,
+        display_scale: float = 1.0,
+    ) -> None:
         self.folder = folder
-        self.annotation_path = annotation_path or folder / "annotations.json"
-        self.auto_detect = auto_detect and _HAS_DETECTOR
-        self.cfg = cfg or (Config() if _HAS_DETECTOR else None)
-        self.display_scale: float = (
-            self.cfg.display_scale if self.cfg else 0.85
-        )
-        # Actual image size after scaling (set once first frame is drawn)
-        self._display_w: int = 0
-        self._display_h: int = 0
+        self.output_path = output_path or (folder / "annotations.json")
+        self.scale = display_scale
 
         # Load frames
         exts = {".png", ".jpg", ".jpeg", ".bmp"}
         self.files = sorted(
-            f for f in folder.iterdir() if f.suffix.lower() in exts)
+            f for f in folder.iterdir() if f.suffix.lower() in exts
+        )
         if not self.files:
             print(f"[ERROR] No image files in {folder}")
             sys.exit(1)
+
         self.n_frames = len(self.files)
-        print(f"[INFO] Loaded {self.n_frames} frames from {folder}")
-
-        # State
-        self.idx: int = 0
+        self.current_idx = 0
         self.annotations: Dict[str, Dict[str, Any]] = {}
-        self.unsaved: bool = False
-        self.playing: bool = False
-        self.show_detector: bool = self.auto_detect
-        self._click_pos: Optional[Tuple[int, int]] = None
-        self._frame_cache: Optional[np.ndarray] = None
-        self._cache_idx: int = -1
+        self.click_pos: Optional[Tuple[int, int]] = None
+        self.unsaved_changes = False
 
-        # Detector (for overlay)
-        self.detector: Optional[BallDetector] = None
-        self.tracker: Optional[BallTracker] = None
-        self.corridor: Optional[TrajectoryCorridor] = None
-        if self.auto_detect and _HAS_DETECTOR:
-            self.detector = BallDetector(self.cfg)
-            self.tracker = BallTracker(self.cfg)
-            self.corridor = TrajectoryCorridor(self.cfg)
-            if self.cfg.corridor_default:
-                self.corridor.set_rect(*self.cfg.corridor_default)
+        # Read first frame to get image dimensions (for bounds clamping)
+        first = cv2.imread(str(self.files[0]))
+        if first is not None:
+            self._img_h, self._img_w = first.shape[:2]
+        else:
+            self._img_h, self._img_w = 0, 0
 
-        # Load existing annotations
-        self._load_annotations()
-
-    # I/O
-
-    def _load_annotations(self) -> None:
-        if self.annotation_path.exists():
-            with open(self.annotation_path) as f:
+        # Load existing annotations if present
+        if self.output_path.exists():
+            with open(self.output_path) as f:
                 data = json.load(f)
             self.annotations = data.get("annotations", {})
-            n = len(self.annotations)
-            print(f"[INFO] Loaded {n} existing annotations "
-                  f"from {self.annotation_path}")
-        else:
-            self.annotations = {}
-
-    def save_annotations(self) -> None:
-        data = {
-            "pitch_folder": str(self.folder),
-            "n_frames": self.n_frames,
-            "annotator": "human",
-            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "annotations": self.annotations,
-        }
-        with open(self.annotation_path, "w") as f:
-            json.dump(data, f, indent=2)
-        self.unsaved = False
-        print(f"[SAVE] Annotations saved to {self.annotation_path}")
-
-    # Frame loading
-
-    def load_frame(self, idx: int) -> np.ndarray:
-        if idx == self._cache_idx and self._frame_cache is not None:
-            return self._frame_cache
-        frame = cv2.imread(str(self.files[idx]))
-        if frame is None:
-            frame = np.zeros((480, 640, 3), np.uint8)
-        self._frame_cache = frame
-        self._cache_idx = idx
-        return frame
-
-    # Detector overlay
-
-    def _run_detector(self, frame: np.ndarray) -> None:
-        """Run the algorithm on the current frame for overlay."""
-        if self.detector is None:
-            return
-        best = self.detector.detect(frame, corridor=self.corridor)
-        self.tracker.update(self.detector.candidates, best)
-
-    def _run_detector_sequence(self) -> None:
-        """Run the detector on all frames from 0 to current index
-        to build proper background model and tracking state."""
-        if self.detector is None:
-            return
-        self.detector.reset_full()
-        self.tracker.reset()
-        for i in range(self.idx + 1):
-            frame = self.load_frame(i)
-            best = self.detector.detect(frame, corridor=self.corridor)
-            self.tracker.update(self.detector.candidates, best)
-
-    # Drawing
-
-    def draw(self) -> np.ndarray:
-        frame = self.load_frame(self.idx)
-        vis = frame.copy()
-        h, w = vis.shape[:2]
-        key = str(self.idx)
-
-        # Detector overlay
-        if self.show_detector and self.detector is not None:
-            # Draw all candidates as small dots
-            for c in self.detector.candidates:
-                col = (0, 200, 200) if c.in_motion_mask else (100, 100, 100)
-                cv2.circle(vis, c.center, 3, col, -1)
-
-            # Draw tracker selection
-            sel = self.tracker.selected if self.tracker else None
-            if sel is not None:
-                cv2.circle(vis, sel.center, 8, (0, 200, 0), 2)
-                cv2.circle(vis, sel.center, 2, (0, 0, 200), -1)
-                bx, by, bw, bh = sel.bbox
-                cv2.rectangle(vis, (bx, by), (bx + bw, by + bh),
-                              (0, 200, 0), 1)
-                put_text(vis,
-                         f"ALGO ({sel.center[0]},{sel.center[1]}) "
-                         f"a={sel.area:.0f} iso={sel.isolation_score:.1f}",
-                         (bx, by - 8), 0.35, (0, 200, 0), 1)
-
-            # Show suppression zones
-            if hasattr(self.detector, "suppressor"):
-                for sx, sy, sr in self.detector.suppressor.suppression_zones:
-                    cv2.circle(vis, (sx, sy), sr, (0, 0, 128), 1)
-
-        # Pitcher zone
-        if self.cfg is not None:
-            pz = self.cfg.pitcher_zone
-            cv2.rectangle(vis, (pz[0], pz[1]), (pz[2], pz[3]),
-                          (128, 128, 0), 1)
-
-        # Human annotation
-        if key in self.annotations:
-            ann = self.annotations[key]
-            if ann.get("visible", False):
-                ax, ay = ann["x"], ann["y"]
-                # Green crosshair for annotated position
-                cv2.drawMarker(vis, (ax, ay), (0, 255, 0),
-                               cv2.MARKER_CROSS, 20, 2)
-                cv2.circle(vis, (ax, ay), 8, (0, 255, 0), 2)
-                put_text(vis, f"ANN ({ax},{ay})",
-                         (ax + 12, ay - 8), 0.38, (0, 255, 0), 1)
+            # Skip to first unannotated frame
+            for i in range(self.n_frames):
+                if str(i) not in self.annotations:
+                    self.current_idx = i
+                    break
             else:
-                put_text(vis, "NOT VISIBLE (annotated)",
-                         (10, h - 40), 0.45, (0, 0, 255), 1)
+                self.current_idx = self.n_frames - 1
+            n_existing = len(self.annotations)
+            print(f"[INFO] Loaded {n_existing} existing annotations. "
+                  f"Resuming at frame {self.current_idx}.")
+
+        print(f"[INFO] {self.n_frames} frames from {folder}")
+        print(f"[INFO] Output: {self.output_path}")
+
+    def _mouse_callback(
+        self, event: int, x: int, y: int, flags: int, param: Any
+    ) -> None:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # Convert display coords back to frame coords
+            real_x = int(x / self.scale) if self.scale != 1.0 else x
+            real_y = int(y / self.scale) if self.scale != 1.0 else y
+            # Clamp to image bounds (prevents out-of-range annotations)
+            h, w = self._img_h, self._img_w
+            real_x = max(0, min(real_x, w - 1))
+            real_y = max(0, min(real_y, h - 1))
+            self.click_pos = (real_x, real_y)
+
+    def _draw_frame(self) -> np.ndarray:
+        """Load and annotate the current frame for display."""
+        frame = cv2.imread(str(self.files[self.current_idx]))
+        if frame is None:
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        disp = frame.copy()
+        h, w = disp.shape[:2]
+        idx_str = str(self.current_idx)
+
+        # Draw existing annotation if any
+        ann = self.annotations.get(idx_str)
+        if ann is not None:
+            if ann.get("visible"):
+                cx, cy = ann["x"], ann["y"]
+                cv2.drawMarker(disp, (cx, cy), (0, 255, 0),
+                               cv2.MARKER_CROSS, 20, 2)
+                cv2.circle(disp, (cx, cy), 8, (0, 255, 0), 2)
+                cv2.putText(disp, f"({cx},{cy})", (cx + 12, cy - 12),
+                            FONT, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+            else:
+                cv2.putText(disp, "NOT VISIBLE", (w // 2 - 80, h // 2),
+                            FONT, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
 
         # Status bar
-        bar_y = 22
-        put_text(vis, f"Frame {self.idx}/{self.n_frames - 1}",
-                 (10, bar_y), 0.50, (255, 255, 255), 1)
+        n_done = len(self.annotations)
+        pct = n_done / self.n_frames * 100 if self.n_frames > 0 else 0
+        status = (f"Frame {self.current_idx}/{self.n_frames - 1}  "
+                  f"| Annotated: {n_done}/{self.n_frames} ({pct:.0f}%)  "
+                  f"| {'* UNSAVED' if self.unsaved_changes else 'Saved'}")
+        cv2.rectangle(disp, (0, 0), (w, 30), (40, 40, 40), -1)
+        cv2.putText(disp, status, (10, 20), FONT, 0.5,
+                    (255, 255, 255), 1, cv2.LINE_AA)
 
-        status_parts = []
-        if key in self.annotations:
-            ann = self.annotations[key]
-            if ann.get("visible"):
-                status_parts.append(f"TAGGED ({ann['x']},{ann['y']})")
-            else:
-                status_parts.append("NOT VISIBLE")
-        else:
-            status_parts.append("NO ANNOTATION")
+        # Controls help
+        help_lines = [
+            "Click=mark ball  N=not visible  B=back  R=redo  S=save  Q=quit"
+        ]
+        for j, line in enumerate(help_lines):
+            cv2.putText(disp, line, (10, h - 10 - j * 18), FONT, 0.4,
+                        (200, 200, 200), 1, cv2.LINE_AA)
 
-        annotated_count = len(self.annotations)
-        status_parts.append(f"Total: {annotated_count}/{self.n_frames}")
+        # Scale for display
+        if self.scale != 1.0:
+            dw = int(w * self.scale)
+            dh = int(h * self.scale)
+            disp = cv2.resize(disp, (dw, dh))
 
-        if self.unsaved:
-            status_parts.append("*UNSAVED*")
-        if self.playing:
-            status_parts.append("PLAYING")
-        if self.show_detector:
-            status_parts.append("ALGO ON")
+        return disp
 
-        put_text(vis, "  |  ".join(status_parts),
-                 (10, bar_y + 22), 0.40, (200, 200, 200), 1)
-
-        # Navigation minimap (thin bar showing annotated frames)
-        bar_h = 8
-        bar_w = w - 20
-        bar_x = 10
-        bar_top = h - 20
-        cv2.rectangle(vis, (bar_x, bar_top),
-                      (bar_x + bar_w, bar_top + bar_h),
-                      (60, 60, 60), -1)
-        # Mark annotated frames
-        for fkey in self.annotations:
-            fi = int(fkey)
-            fx = bar_x + int(fi / max(self.n_frames - 1, 1) * bar_w)
-            ann = self.annotations[fkey]
-            col = (0, 200, 0) if ann.get("visible") else (0, 0, 200)
-            cv2.line(vis, (fx, bar_top), (fx, bar_top + bar_h), col, 1)
-        # Current position
-        cx = bar_x + int(self.idx / max(self.n_frames - 1, 1) * bar_w)
-        cv2.line(vis, (cx, bar_top - 2), (cx, bar_top + bar_h + 2),
-                 (255, 255, 255), 2)
-
-        # Controls hint
-        hints = ("[</>] Navigate  [Space] Play  [Click] Tag  "
-                 "[V] Not visible  [Del] Remove  [T] Algo  [S] Save  [Q] Quit")
-        put_text(vis, hints, (10, h - 4), 0.30, (180, 180, 180), 1)
-
-        return vis
-
-    # Mouse callback
-
-    def _on_mouse(self, event: int, x: int, y: int,
-                  flags: int, param: Any) -> None:
-        if event == cv2.EVENT_LBUTTONDOWN:
-            # Convert display coordinates back to original frame coords.
-            if self._display_w > 0 and self._display_h > 0:
-                frame = self.load_frame(self.idx)
-                fh, fw = frame.shape[:2]
-                ox = int(x * fw / self._display_w)
-                oy = int(y * fh / self._display_h)
-            else:
-                ox, oy = x, y
-            print(f"[CLICK] display=({x},{y}) -> frame=({ox},{oy})  "
-                  f"idx={self.idx}")
-            self._click_pos = (ox, oy)
-
-    # Main loop
+    def save(self) -> None:
+        """Save annotations to disk."""
+        data = {
+            "schema_version": "1.0",
+            "folder": str(self.folder),
+            "n_frames": self.n_frames,
+            "image_dimensions": {
+                "width": self._img_w,
+                "height": self._img_h,
+            },
+            "frame_files": [f.name for f in self.files],
+            "annotations": self.annotations,
+        }
+        with open(self.output_path, "w") as f:
+            json.dump(data, f, indent=2)
+        self.unsaved_changes = False
+        print(f"[SAVED] {len(self.annotations)} annotations → "
+              f"{self.output_path}")
 
     def run(self) -> None:
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
-        cv2.setMouseCallback(WINDOW_NAME, self._on_mouse)
-
-        # If auto-detect, run detector sequence up to current frame
-        if self.auto_detect and self.detector is not None:
-            print("[INFO] Running detector on all frames (building "
-                  "background model)...")
-            self.idx = self.n_frames - 1
-            self._run_detector_sequence()
-            self.idx = 0
-            self.detector.reset_full()
-            self.tracker.reset()
-            # Re-run up to frame 0
-            self._run_detector_sequence()
-            print("[INFO] Detector ready.")
-
-        last_play_time = time.time()
+        """Main annotation loop."""
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(WINDOW_NAME, self._mouse_callback)
 
         while True:
-            # Handle click
-            if self._click_pos is not None:
-                ox, oy = self._click_pos
-                self._click_pos = None
-                key = str(self.idx)
-                self.annotations[key] = {
-                    "x": ox, "y": oy, "visible": True
+            self.click_pos = None
+            disp = self._draw_frame()
+            cv2.imshow(WINDOW_NAME, disp)
+
+            key = cv2.waitKey(30) & 0xFF
+
+            # Check for click
+            if self.click_pos is not None:
+                cx, cy = self.click_pos
+                self.annotations[str(self.current_idx)] = {
+                    "x": cx, "y": cy, "visible": True,
+                    "frame_file": self.files[self.current_idx].name,
                 }
-                self.unsaved = True
+                self.unsaved_changes = True
+                print(f"  F{self.current_idx:03d}: ball at ({cx}, {cy})")
+                # Auto-advance
+                if self.current_idx < self.n_frames - 1:
+                    self.current_idx += 1
+                self.click_pos = None
+                continue
 
-            vis = self.draw()
+            if key == ord("n"):
+                # Mark not visible
+                self.annotations[str(self.current_idx)] = {
+                    "x": None, "y": None, "visible": False,
+                    "frame_file": self.files[self.current_idx].name,
+                }
+                self.unsaved_changes = True
+                print(f"  F{self.current_idx:03d}: not visible")
+                if self.current_idx < self.n_frames - 1:
+                    self.current_idx += 1
 
-            # Scale for display
-            dw = int(vis.shape[1] * self.display_scale)
-            dh = int(vis.shape[0] * self.display_scale)
-            vis = cv2.resize(vis, (dw, dh))
-            self._display_w = dw
-            self._display_h = dh
+            elif key == ord("b") or key == 81:  # B or Left arrow
+                if self.current_idx > 0:
+                    self.current_idx -= 1
 
-            cv2.imshow(WINDOW_NAME, vis)
+            elif key == ord("r"):
+                # Remove current annotation
+                idx_str = str(self.current_idx)
+                if idx_str in self.annotations:
+                    del self.annotations[idx_str]
+                    self.unsaved_changes = True
+                    print(f"  F{self.current_idx:03d}: annotation removed")
 
-            # Auto-play
-            if self.playing:
-                now = time.time()
-                if now - last_play_time > 1.0 / 15.0:  # 15 fps playback
-                    last_play_time = now
-                    if self.idx < self.n_frames - 1:
-                        self.idx += 1
-                        if self.show_detector and self.detector is not None:
-                            frame = self.load_frame(self.idx)
-                            self._run_detector(frame)
-                    else:
-                        self.playing = False
+            elif key == ord("s"):
+                self.save()
 
-            k = cv2.waitKey(30) & 0xFF
-
-            if k in (ord("q"), 27):  # Quit
-                if self.unsaved:
-                    print("[WARN] Unsaved annotations! Save? (y/n)")
-                    resp = input("> ").strip().lower()
-                    if resp in ("y", "yes", "s", "si"):
-                        self.save_annotations()
+            elif key in (ord("q"), 27):
+                if self.unsaved_changes:
+                    print("[WARN] Unsaved changes! Saving before exit...")
+                    self.save()
                 break
 
-            elif k == ord("s"):
-                self.save_annotations()
-
-            elif k == ord(" "):
-                self.playing = not self.playing
-                last_play_time = time.time()
-
-            elif k == 83 or k == ord("d"):  # Right arrow or D
-                self.playing = False
-                if self.idx < self.n_frames - 1:
-                    self.idx += 1
-                    if self.show_detector and self.detector is not None:
-                        frame = self.load_frame(self.idx)
-                        self._run_detector(frame)
-
-            elif k == 81 or k == ord("a"):  # Left arrow or A
-                self.playing = False
-                if self.idx > 0:
-                    self.idx -= 1
-                    # Re-run detector from scratch to this frame
-                    if self.show_detector and self.detector is not None:
-                        self._run_detector_sequence()
-
-            elif k == 80:  # Home
-                self.idx = 0
-                self.playing = False
-                if self.show_detector and self.detector is not None:
-                    self._run_detector_sequence()
-
-            elif k == 87:  # End
-                self.idx = self.n_frames - 1
-                self.playing = False
-                if self.show_detector and self.detector is not None:
-                    self._run_detector_sequence()
-
-            elif k == ord("g"):  # Go to frame
-                self.playing = False
-                try:
-                    n = int(input(f"Go to frame [0-{self.n_frames - 1}]: "))
-                    self.idx = max(0, min(n, self.n_frames - 1))
-                    if self.show_detector and self.detector is not None:
-                        self._run_detector_sequence()
-                except ValueError:
-                    print("[WARN] Invalid frame number")
-
-            elif k == ord("v"):  # Mark not visible
-                key = str(self.idx)
-                self.annotations[key] = {"visible": False}
-                self.unsaved = True
-
-            elif k == 8:  # Backspace
-                key = str(self.idx)
-                if key in self.annotations:
-                    del self.annotations[key]
-                    self.unsaved = True
-
-            elif k == ord("t"):  # Toggle algorithm overlay
-                if not _HAS_DETECTOR:
-                    print("[WARN] msb package not available for overlay")
-                else:
-                    self.show_detector = not self.show_detector
-                    if self.show_detector:
-                        if self.detector is None:
-                            self.detector = BallDetector(self.cfg)
-                            self.tracker = BallTracker(self.cfg)
-                            self.corridor = TrajectoryCorridor(self.cfg)
-                            if self.cfg.corridor_default:
-                                self.corridor.set_rect(
-                                    *self.cfg.corridor_default)
-                        print("[INFO] Running detector sequence...")
-                        self._run_detector_sequence()
-                        print("[INFO] Algo overlay ON")
-                    else:
-                        print("[INFO] Algo overlay OFF")
+            # Auto-navigation with arrow keys
+            elif key == 83:  # Right arrow
+                if self.current_idx < self.n_frames - 1:
+                    self.current_idx += 1
+            elif key == 82:  # Up arrow — jump forward 10
+                self.current_idx = min(self.n_frames - 1,
+                                       self.current_idx + 10)
+            elif key == 84:  # Down arrow — jump back 10
+                self.current_idx = max(0, self.current_idx - 10)
 
         cv2.destroyAllWindows()
 
+        # Final stats
+        n_vis = sum(1 for v in self.annotations.values()
+                    if v.get("visible"))
+        n_not_vis = sum(1 for v in self.annotations.values()
+                        if not v.get("visible"))
+        print(f"\n[DONE] {len(self.annotations)} total annotations: "
+              f"{n_vis} visible, {n_not_vis} not visible")
 
-def main():
+
+def main() -> None:
     ap = argparse.ArgumentParser(
-        description="MSB Frame Annotator — tag ball positions in recorded "
-                    "pitch frames")
-    ap.add_argument("folder", help="Path to pitch recording folder "
-                    "(e.g. pitches/20260227_205241)")
-    ap.add_argument("--annotations", "-a", default=None,
-                    help="Path to annotations JSON file "
-                    "(default: <folder>/annotations.json)")
-    ap.add_argument("--auto-detect", action="store_true",
-                    help="Run the algorithm detector as overlay "
-                    "for faster annotation")
-    ap.add_argument("-c", "--config", default=None,
-                    help="Path to config file (TOML or JSON)")
+        description="Annotate ball positions in pitch recording frames")
+    ap.add_argument("folder",
+                    help="Path to pitch recording folder with frame images")
+    ap.add_argument("-o", "--output", default=None,
+                    help="Output annotations JSON "
+                         "(default: <folder>/annotations.json)")
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="Display scale factor (default: 1.0)")
     args = ap.parse_args()
 
     folder = Path(args.folder)
@@ -472,18 +272,11 @@ def main():
         print(f"[ERROR] Not a directory: {folder}")
         sys.exit(1)
 
-    # Load config
-    cfg: Optional[Config] = None
-    if _HAS_DETECTOR:
-        if args.config:
-            cfg = Config.load(args.config)
-        else:
-            cfg_path = Path("config.toml")
-            cfg = Config.load(str(cfg_path)) if cfg_path.exists() else Config()
-
-    ann_path = Path(args.annotations) if args.annotations else None
-    annotator = Annotator(folder, ann_path, auto_detect=args.auto_detect,
-                          cfg=cfg)
+    annotator = FrameAnnotator(
+        folder,
+        output_path=Path(args.output) if args.output else None,
+        display_scale=args.scale,
+    )
     annotator.run()
 
 

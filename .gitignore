@@ -17,42 +17,47 @@ dist/
 build/
 *.egg-info/
 *.egg
-wheels/
 
-# Testing & coverage
+# Testing
 .pytest_cache/
 .coverage
 htmlcov/
-*.xml
 
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb
-
-# ML / CV artifacts
-# Model weights
+# ML / model weights (never tracked)
 *.pt
 *.pth
 *.onnx
 *.engine
 *.trt
 *.weights
-*.caffemodel
 
-# Datasets / captured frames (can be very large)
+# Generated data (re-creatable, never tracked)
+yolo_dataset/
+runs/
+pitches/
 data/
 datasets/
 frames/
-screenshots/
 recordings/
 *.mp4
 *.avi
 *.mkv
+*.zip
 
-# Logs & debug output
+# Batter hitbox fingerprint samples (captured at runtime)
+features/batter_hitbox/dataset/
+
+# Weights directory (keep README, ignore binaries)
+weights/*.pt
+weights/*.onnx
+weights/*.pth
+
+# Dataset packaging
+yolo_dataset.zip
+
+# Logs / debug
 logs/
 *.log
-debug_output/
 
 # OS
 .DS_Store
@@ -64,12 +69,3 @@ desktop.ini
 .idea/
 *.suo
 *.user
-
-# Project-specific
-# Keep chat context files out of the repo
-gemini chat.txt
-gpt chat.txt
-
-# MSB dataset & pitch recordings
-dataset/
-pitches/
