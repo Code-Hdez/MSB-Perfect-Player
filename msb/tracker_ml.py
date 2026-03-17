@@ -11,11 +11,14 @@ This tracker keeps only:
   - Track lifecycle: IDLE → ACTIVE → LOST
   - Gap bridging (coast through short detection dropouts)
 
-It is simpler, faster, and more robust when paired with a good detector.
+v2: Each position entry stores a **wall-clock timestamp** alongside the
+frame index — ``(x, y, frame_idx, timestamp)``.  This allows the
+predictor to use real time instead of frame counts.
 """
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from enum import Enum, auto
 from typing import List, Optional, Tuple
@@ -27,7 +30,7 @@ from msb.config import Config
 from msb.detector import BallCandidate
 
 
-#  TRACK STATE
+# TRACK STATE
 
 class MLTrackState(Enum):
     IDLE = auto()
@@ -35,13 +38,21 @@ class MLTrackState(Enum):
     LOST = auto()
 
 
-#  ML BALL TRACK
+# ML BALL TRACK
 
 class MLBallTrack:
-    """Single tracked ball with Kalman filter (constant-velocity model)."""
+    """Single tracked ball with Kalman filter (constant-velocity model).
+
+    Position entries are ``(x, y, frame_idx, timestamp)`` where
+    *timestamp* is ``time.perf_counter()`` at the moment of the
+    detection.
+    """
 
     def __init__(self, pos: Tuple[int, int], frame_idx: int,
-                 conf: float = 0.0) -> None:
+                 conf: float = 0.0,
+                 timestamp: Optional[float] = None) -> None:
+        ts = timestamp if timestamp is not None else time.perf_counter()
+
         # Kalman: state = [x, y, vx, vy]
         self._kf = cv2.KalmanFilter(4, 2, 0)
         self._kf.transitionMatrix = np.array([
@@ -59,7 +70,7 @@ class MLBallTrack:
             [[pos[0]], [pos[1]], [0], [0]], dtype=np.float32)
 
         self.positions: deque = deque(maxlen=120)
-        self.positions.append((pos[0], pos[1], frame_idx))
+        self.positions.append((pos[0], pos[1], frame_idx, ts))
         self.frames_since_seen: int = 0
         self.total_frames: int = 1
         self.active: bool = True
@@ -83,12 +94,16 @@ class MLBallTrack:
         return self.positions[-1][2]
 
     @property
+    def last_timestamp(self) -> float:
+        """Wall-clock timestamp of the most recent position."""
+        return self.positions[-1][3]
+
+    @property
     def predicted_next(self) -> Tuple[int, int]:
         vx, vy = self.velocity
         p = self.last_pos
         return (int(p[0] + vx), int(p[1] + vy))
 
-    # Keep same attribute name for compatibility with predictor/visualiser
     @property
     def _frames_in_pitcher_zone(self) -> int:
         return 0
@@ -106,9 +121,11 @@ class MLBallTrack:
         self._kf.correct(meas)
 
     def update(self, pos: Tuple[int, int], frame_idx: int,
-               conf: float = 0.0) -> None:
+               conf: float = 0.0,
+               timestamp: Optional[float] = None) -> None:
+        ts = timestamp if timestamp is not None else time.perf_counter()
         self.kf_correct(pos[0], pos[1])
-        self.positions.append((pos[0], pos[1], frame_idx))
+        self.positions.append((pos[0], pos[1], frame_idx, ts))
         self.frames_since_seen = 0
         self.total_frames += 1
         # Running average confidence
@@ -136,8 +153,17 @@ class MLBallTrack:
         df = pts[-1][2] - pts[0][2]
         return dy / df if df > 0 else 0.0
 
+    def velocity_y_px_per_sec(self) -> float:
+        """Vertical velocity in pixels/second using wall-clock time."""
+        pts = list(self.positions)
+        if len(pts) < 2:
+            return 0.0
+        dy = pts[-1][1] - pts[0][1]
+        dt = pts[-1][3] - pts[0][3]
+        return dy / dt if dt > 1e-6 else 0.0
 
-#  ML BALL TRACKER
+
+# ML BALL TRACKER
 
 class MLBallTracker:
     """Simplified tracker for ML-detected ball candidates.
@@ -158,18 +184,21 @@ class MLBallTracker:
         self._max_match_dist = max_match_dist
         self._max_gap = max_gap_frames
         self._min_conf_start = min_conf_start
+        self._killed_positions: list = []
 
     def reset(self) -> None:
         self.track = None
         self.state = MLTrackState.IDLE
         self.selected = None
         self._frame_idx = 0
+        self._killed_positions.clear()
 
     def update(
         self,
         candidates: List[BallCandidate],
         best_candidate: Optional[BallCandidate] = None,
         detector=None,  # unused, kept for interface compat
+        timestamp: Optional[float] = None,
     ) -> Optional[MLBallTrack]:
         """One tracker step.
 
@@ -181,7 +210,11 @@ class MLBallTracker:
             Ignored (kept for API compatibility).
         detector : optional
             Ignored.
+        timestamp : float, optional
+            Wall-clock timestamp for this frame.  If None, uses
+            ``time.perf_counter()`` at call time.
         """
+        ts = timestamp if timestamp is not None else time.perf_counter()
         self._frame_idx += 1
         self.selected = None
 
@@ -192,7 +225,7 @@ class MLBallTracker:
 
             if chosen is not None:
                 self.track.update(chosen.center, self._frame_idx,
-                                  conf=chosen.score)
+                                  conf=chosen.score, timestamp=ts)
                 self.selected = chosen
                 self.state = MLTrackState.ACTIVE
             else:
@@ -207,7 +240,8 @@ class MLBallTracker:
             for c in candidates:
                 if c.score >= self._min_conf_start:
                     self.track = MLBallTrack(
-                        c.center, self._frame_idx, conf=c.score)
+                        c.center, self._frame_idx, conf=c.score,
+                        timestamp=ts)
                     self.state = MLTrackState.ACTIVE
                     self.selected = c
                     break
@@ -216,6 +250,31 @@ class MLBallTracker:
             self.state = MLTrackState.IDLE
 
         return self.track
+
+    def kill_track(self) -> None:
+        """Kill the current track and remember its position."""
+        if self.track is not None and self.track.active:
+            self._killed_positions.append(
+                (self.track.last_pos[0], self.track.last_pos[1],
+                 self._frame_idx))
+        self.track = None
+        self.state = MLTrackState.IDLE
+        self.selected = None
+
+    def expire_killed(self, max_age: int = 90) -> None:
+        """Drop killed positions older than *max_age* frames."""
+        cutoff = self._frame_idx - max_age
+        self._killed_positions = [
+            (kx, ky, kf) for kx, ky, kf in self._killed_positions
+            if kf >= cutoff
+        ]
+
+    def is_near_killed(self, x: int, y: int, radius: int = 30) -> bool:
+        """Return True if (x, y) is near a recently-killed position."""
+        return any(
+            abs(x - kx) < radius and abs(y - ky) < radius
+            for kx, ky, _ in self._killed_positions
+        )
 
     def _match_nearest(
         self,
@@ -231,18 +290,33 @@ class MLBallTracker:
         if self.track is not None:
             vx, vy = self.track.velocity
             speed = np.hypot(vx, vy)
-        max_d = max(self._max_match_dist, 3.0 * speed)
+        max_d = max(self._max_match_dist, 2.0 * speed)
+        max_d = min(max_d, 150.0)
         # Expand radius if we've missed recent frames
         if self.track is not None:
-            max_d *= (1.0 + 0.3 * self.track.frames_since_seen)
+            max_d *= (1.0 + 0.2 * self.track.frames_since_seen)
+            max_d = min(max_d, 180.0)
+
+        last_pos = pred
+        recent_dy = 0.0
+        if self.track is not None:
+            last_pos = self.track.last_pos
+            pts = list(self.track.positions)
+            if len(pts) >= 2:
+                recent_dy = float(pts[-1][1] - pts[-2][1])
 
         best_d = float("inf")
         chosen: Optional[BallCandidate] = None
 
         for c in candidates:
+            if recent_dy > 8.0 and c.center[1] < last_pos[1] - 20:
+                continue
+
             d = np.hypot(c.center[0] - pred[0], c.center[1] - pred[1])
-            if d < max_d and d < best_d:
-                best_d = d
-                chosen = c
+            if d < max_d:
+                score_d = d - 8.0 * float(c.score)
+                if score_d < best_d:
+                    best_d = score_d
+                    chosen = c
 
         return chosen

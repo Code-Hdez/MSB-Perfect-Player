@@ -38,7 +38,7 @@ class Config:
     original ``pitch_analyzer.py`` module-level constants.
     """
 
-    #Capture
+    # Capture
     screen_roi: Tuple[int, int, int, int] = (378, 127, 1542, 1019)
     monitor_index: int = 0
     target_fps: int = 60
@@ -109,7 +109,39 @@ class Config:
     # Display
     display_scale: float = 0.85
 
-    #  Serialisation helpers
+    # Game-phase FSM
+    phase_ssim_batter_thresh: float = 0.72
+    phase_ssim_deviation_thresh: float = 0.55
+    phase_hysteresis_enter: int = 5
+    phase_hysteresis_exit: int = 8
+    phase_ref_thumb_w: int = 160
+    phase_ref_thumb_h: int = 120
+    phase_ref_refresh_interval: int = 120
+    phase_post_swing_lockout_sec: float = 0.8
+    phase_reset_timeout_sec: float = 0.5
+    phase_min_pitch_vy_trigger: float = 40.0
+
+    # Swing controller
+    ctrl_kp: float = 0.006
+    ctrl_kd: float = 0.0015
+    ctrl_kff: float = 0.0008
+    ctrl_pipeline_latency_sec: float = 0.060
+    ctrl_swing_startup_sec: float = 0.140
+    ctrl_swing_hold_sec: float = 0.100
+    ctrl_swing_window_sec: float = 0.060
+    ctrl_cooldown_sec: float = 0.400
+    ctrl_deadzone_px: float = 12.0
+
+    # Metrics / telemetry
+    metrics_enabled: bool = True
+    metrics_csv_path: str = ""
+    metrics_fps_window: int = 300
+
+    # Per-character contact offset (px)
+    contact_offset_x: int = 0
+    contact_offset_y: int = 0
+
+    # Serialisation helpers
 
     @classmethod
     def load(cls, path: str) -> "Config":

@@ -51,7 +51,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-#  CONFIGURATION
+# CONFIGURATION
 
 # Screen capture
 
@@ -68,7 +68,7 @@ Change this if Dolphin is on your second screen.
 
 TARGET_FPS: int = 60
 
-# Hitbox colour detection (HSV) - for strike-zone outline detection
+# Hitbox colour detection (HSV)
 
 HITBOX_HSV_LOWER: np.ndarray = np.array([12, 70, 150])
 HITBOX_HSV_UPPER: np.ndarray = np.array([38, 255, 255])
@@ -86,7 +86,7 @@ DOMINANT_COLORS_K: int = 5
 
 # Matching
 
-HIST_MATCH_THRESHOLD: float = 0.35
+HIST_MATCH_THRESHOLD: float = 0.45
 RECOGNITION_TOP_K: int = 3
 
 # Paths
@@ -148,7 +148,7 @@ COL_ORANGE  = (0, 165, 255)
 FONT       = cv2.FONT_HERSHEY_SIMPLEX
 
 
-#  UTILITY HELPERS
+# UTILITY HELPERS
 
 def crop(frame: np.ndarray, rect: Tuple[int, int, int, int]) -> np.ndarray:
     """Crop *frame* to pixel rectangle (x1, y1, x2, y2). Returns a view."""
@@ -216,7 +216,7 @@ def draw_dashed_rect(img: np.ndarray,
         cv2.line(img, (x2, y), (x2, min(y + dash, y2)), color, thickness)
 
 
-#  CLICK-TO-SELECT ROI SYSTEM
+# CLICK-TO-SELECT ROI SYSTEM
 
 class ClickPhase(Enum):
     """State machine phases for the 4-click capture flow."""
@@ -359,7 +359,7 @@ class ClickCollector:
         return vis
 
 
-#  HITBOX DETECTOR  (runs inside a user-provided pixel ROI)
+# HITBOX DETECTOR
 
 class HitboxResult:
     """Container for one frame's hitbox detection output."""
@@ -454,7 +454,6 @@ class HitboxDetector:
             if solidity < self.min_solidity:
                 continue
 
-            # Store valid contour for debug display
             result.all_contours_local.append(cnt)
 
             score = area * solidity
@@ -495,7 +494,7 @@ class HitboxDetector:
         return result
 
 
-#  CHARACTER FINGERPRINT
+# CHARACTER FINGERPRINT
 
 class Fingerprint:
     """Visual fingerprint extracted from a single game frame."""
@@ -590,7 +589,7 @@ class CharacterFingerprinter:
         return fp
 
 
-#  FINGERPRINT DATABASE
+# FINGERPRINT DATABASE
 
 class FingerprintDB:
     """Persist and retrieve per-character fingerprint samples.
@@ -721,7 +720,7 @@ class FingerprintDB:
             json.dump(self._index, fh, indent=2)
 
 
-#  FINGERPRINT MATCHER
+# FINGERPRINT MATCHER
 
 class MatchResult:
     __slots__ = ("character", "confidence", "hist_score", "orb_score")
@@ -789,12 +788,13 @@ class FingerprintMatcher:
         return results[:top_k]
 
 
-#  BATTER STATE CLASSIFIER  (NORMAL vs NON-NORMAL animation detection)
+# BATTER STATE CLASSIFIER
 
 class BatterState(Enum):
     """Visual/animation state of the batter."""
-    NORMAL     = auto()   # standard batting stance (waiting for pitch)
-    NON_NORMAL = auto()   # charged swing or idle/silly animation
+    NORMAL        = auto()   # standard batting stance (waiting for pitch)
+    NON_NORMAL    = auto()   # charged swing or idle/silly animation
+    HIT_ANIMATION = auto()   # post-swing hit animation (bat contact)
 
 
 class BatterStateClassifier:
@@ -826,6 +826,9 @@ class BatterStateClassifier:
         self.hist_score: float = 1.0             # best histogram correl
         self.loaded: bool = False
         self._frame_counter: int = 0             # for interval-based skipping
+        # Hit-animation detection: frames since last external swing signal
+        self._swing_signalled: bool = False
+        self._frames_since_swing: int = 999
 
     # Load / reset
 
@@ -873,6 +876,13 @@ class BatterStateClassifier:
         self.raw_score = 1.0
         self.grey_score = 1.0
         self.hist_score = 1.0
+        self._swing_signalled = False
+        self._frames_since_swing = 999
+
+    def notify_swing(self) -> None:
+        """Call when the swing controller commits a swing."""
+        self._swing_signalled = True
+        self._frames_since_swing = 0
 
     # Per-frame classification
 
@@ -926,7 +936,6 @@ class BatterStateClassifier:
         self.grey_score = best_grey
         self.hist_score = best_hist
 
-        # Weighted combination (grey is sharper discriminator)
         combined = 0.60 * best_grey + 0.40 * best_hist
         self.raw_score = combined
 
@@ -938,6 +947,15 @@ class BatterStateClassifier:
 
         # Rolling-window majority vote
         self._window.append(frame_is_normal)
+
+        self._frames_since_swing += 1
+        _HIT_ANIM_WINDOW = 30  # frames after swing to check
+        _HIT_ANIM_THRESH = 0.30  # very low similarity = swing animation
+        if (self._swing_signalled
+                and self._frames_since_swing <= _HIT_ANIM_WINDOW
+                and combined < _HIT_ANIM_THRESH):
+            self.current_state = BatterState.HIT_ANIMATION
+            return self.current_state
 
         if len(self._window) >= 3:
             normal_count = sum(self._window)
@@ -953,7 +971,7 @@ class BatterStateClassifier:
         return self.current_state
 
 
-#  MOVEMENT TRACKER  (batter tracking + strike-zone prediction & anti-flicker)
+# MOVEMENT TRACKER
 
 class MovementTracker:
     """Track the batter's position and predict / stabilise the strike zone.
@@ -990,14 +1008,14 @@ class MovementTracker:
         self._templates_ds: List[np.ndarray] = []         # downscaled templates
         self._template_sizes_ds: List[Tuple[int, int]] = []
 
-        # Batter search region (union of all calibration batter ROIs + margin)
         self._search_region: Optional[Tuple[int, int, int, int]] = None
-        # Wide strike-zone search (union of all calibration strike ROIs + pad)
         self._wide_strike_search: Optional[Tuple[int, int, int, int]] = None
 
-        # Affine model coefficients: strike = [bx, by, 1] @ coeff
         self._sx_coeff: Optional[np.ndarray] = None
         self._sy_coeff: Optional[np.ndarray] = None
+
+        self._delaunay = None
+        self._tri_affines = None
 
         # Per-frame tracking state
         self.batter_center: Optional[Tuple[int, int]] = None
@@ -1024,6 +1042,8 @@ class MovementTracker:
 
         self.loaded: bool = False
         self.character: str = ""
+
+        self.contact_offset: Tuple[int, int] = (0, 0)
 
     # Load calibration
 
@@ -1073,7 +1093,6 @@ class MovementTracker:
             self._cal_strike_rois.append(sr)
             self._cal_strike_sizes.append((sr[2] - sr[0], sr[3] - sr[1]))
 
-            # Load batter template (grey-scale for fast matching)
             tmpl_path = sdir / "batter_roi.png"
             if tmpl_path.exists():
                 img = cv2.imread(str(tmpl_path))
@@ -1081,7 +1100,6 @@ class MovementTracker:
                     grey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                     self._templates.append(grey)
                     self._template_sizes.append((grey.shape[1], grey.shape[0]))
-                    # Pre-compute downscaled template
                     ds = TRACK_DOWNSCALE
                     grey_ds = cv2.resize(
                         grey, (grey.shape[1] // ds, grey.shape[0] // ds),
@@ -1114,8 +1132,6 @@ class MovementTracker:
         self._fit_model()
         self.loaded = True
 
-        # Initialise last-normal from the first calibration sample so
-        # the state classifier has a starting ROI on the very first frame.
         self._last_normal_center = self._cal_batter_centers[0]
         self._last_normal_roi = self._cal_batter_rois[0]
         self._last_normal_score = 0.0
@@ -1126,7 +1142,13 @@ class MovementTracker:
         return True
 
     def _fit_model(self) -> None:
-        """Least-squares affine: strike_centre = f(batter_centre)."""
+        """Build mapping from batter centre → strike-zone centre.
+
+        With >= 6 calibration points, uses **piecewise-affine** via
+        Delaunay triangulation for much higher accuracy.  Falls back
+        to a single global affine for < 6 points (backward compat).
+        """
+        n = len(self._cal_batter_centers)
         A = np.array([[bc[0], bc[1], 1.0]
                        for bc in self._cal_batter_centers])
         sx = np.array([sc[0] for sc in self._cal_strike_centers],
@@ -1134,14 +1156,66 @@ class MovementTracker:
         sy = np.array([sc[1] for sc in self._cal_strike_centers],
                       dtype=np.float64)
 
+        # Global affine (always fitted — used as fallback)
         self._sx_coeff, *_ = np.linalg.lstsq(A, sx, rcond=None)
         self._sy_coeff, *_ = np.linalg.lstsq(A, sy, rcond=None)
 
         pred_sx = A @ self._sx_coeff
         pred_sy = A @ self._sy_coeff
         err = np.sqrt((pred_sx - sx) ** 2 + (pred_sy - sy) ** 2)
-        print(f"[TRACK] Affine model mean err: {err.mean():.1f} px, "
-              f"max: {err.max():.1f} px")
+        print(f"[TRACK] Global affine mean err: {err.mean():.1f} px, "
+              f"max: {err.max():.1f} px  ({n} points)")
+
+        # Piecewise-affine via Delaunay (requires scipy)
+        self._delaunay = None
+        self._tri_affines = None
+        if n >= 6:
+            try:
+                from scipy.spatial import Delaunay
+                src_pts = np.array(self._cal_batter_centers, dtype=np.float64)
+                dst_pts = np.column_stack([sx, sy])
+                tri = Delaunay(src_pts)
+
+                affines = []
+                for simplex in tri.simplices:
+                    src_tri = src_pts[simplex]  # 3x2
+                    dst_tri = dst_pts[simplex]  # 3x2
+                    # Solve: [x y 1] @ M = [sx sy]
+                    A_tri = np.column_stack([src_tri, np.ones(3)])
+                    Mx, *_ = np.linalg.lstsq(A_tri, dst_tri[:, 0], rcond=None)
+                    My, *_ = np.linalg.lstsq(A_tri, dst_tri[:, 1], rcond=None)
+                    affines.append((Mx, My))
+
+                self._delaunay = tri
+                self._tri_affines = affines
+
+                pw_err = []
+                for i in range(n):
+                    pred = self._piecewise_predict(src_pts[i])
+                    pw_err.append(np.hypot(pred[0] - sx[i], pred[1] - sy[i]))
+                pw_err = np.array(pw_err)
+                print(f"[TRACK] Piecewise-affine mean err: {pw_err.mean():.1f} px, "
+                      f"max: {pw_err.max():.1f} px  (Delaunay, {len(tri.simplices)} tris)")
+            except ImportError:
+                print("[TRACK] scipy not installed — using global affine only. "
+                      "pip install scipy for piecewise-affine calibration.")
+
+    def _piecewise_predict(self, bc: np.ndarray) -> Tuple[float, float]:
+        """Predict strike-zone centre using piecewise-affine mapping."""
+        if self._delaunay is None or self._tri_affines is None:
+            # Fallback to global affine
+            inp = np.array([bc[0], bc[1], 1.0])
+            return (float(inp @ self._sx_coeff), float(inp @ self._sy_coeff))
+
+        simplex_idx = self._delaunay.find_simplex(bc)
+        if simplex_idx >= 0:
+            Mx, My = self._tri_affines[simplex_idx]
+            inp = np.array([bc[0], bc[1], 1.0])
+            return (float(inp @ Mx), float(inp @ My))
+        else:
+            # Point outside convex hull — use nearest triangle via global affine
+            inp = np.array([bc[0], bc[1], 1.0])
+            return (float(inp @ self._sx_coeff), float(inp @ self._sy_coeff))
 
     # Per-frame update
 
@@ -1152,6 +1226,10 @@ class MovementTracker:
         """Process one frame.  Returns the HitboxResult (may be from the
         predicted search region).  Check ``sz_*`` attributes for the
         stabilised strike-zone state.
+
+        Uses **cursor-first** strategy: try to detect the gold pentagon
+        directly first (fast HSV threshold).  Only fall back to expensive
+        batter template matching when the cursor isn't visible.
 
         Parameters
         ----------
@@ -1165,37 +1243,52 @@ class MovementTracker:
 
         h, w = frame.shape[:2]
 
-        # 1) State-gated position update
+        # Cursor-first detection
+        wide_roi = self.strike_roi_search or self._wide_strike_search
+        hbox_early = detector.detect(frame, wide_roi)
+
+        if hbox_early.found:
+            self._stabilise(hbox_early)
+            if not hasattr(self, '_cursor_first_skip'):
+                self._cursor_first_skip = 0
+            self._cursor_first_skip += 1
+            if self._cursor_first_skip % 3 == 0:
+                is_normal = (batter_state is None
+                             or batter_state == BatterState.NORMAL)
+                if is_normal:
+                    self._find_batter(frame)
+                    if self.batter_center is not None:
+                        self._last_normal_center = self.batter_center
+                        self._last_normal_roi = self.batter_roi_pred
+                        self._last_normal_score = self.batter_match_score
+                        self._predict_strike(self.batter_center, w, h)
+            return hbox_early
+
+        # Fallback: batter template matching
         is_normal = (batter_state is None
                      or batter_state == BatterState.NORMAL)
 
         if is_normal:
-            # Only run expensive template matching when NORMAL
             self._find_batter(frame)
-            # Accept the template-match result; save as last-known NORMAL
             if self.batter_center is not None:
                 self._last_normal_center = self.batter_center
                 self._last_normal_roi = self.batter_roi_pred
                 self._last_normal_score = self.batter_match_score
         else:
-            # NON_NORMAL — skip template matching entirely, use frozen pos
             if self._last_normal_center is not None:
                 self.batter_center = self._last_normal_center
                 self.batter_roi_pred = self._last_normal_roi
                 self.batter_match_score = self._last_normal_score
 
-        # 3) Predict strike-zone from (gated) batter position
         if self.batter_center is not None:
             self._predict_strike(self.batter_center, w, h)
 
-        # 4) Detect gold hitbox.  Use narrowed search if prediction is
-        #    available, otherwise fall back to the wide calibrated region.
+        # Narrowed hitbox search with prediction
         search_roi = self.strike_roi_search
         if search_roi is None:
             search_roi = self._wide_strike_search
         hbox = detector.detect(frame, search_roi)
 
-        # 5) Stabilise against blinks
         self._stabilise(hbox)
 
         return hbox
@@ -1248,7 +1341,7 @@ class MovementTracker:
                             fx + tw_full + ox, fy + th_full + oy)
 
         self.batter_match_score = best_score
-        if best_score >= 0.25:
+        if best_score >= 0.35:
             self.batter_center = best_center
             self.batter_roi_pred = best_roi
 
@@ -1258,9 +1351,11 @@ class MovementTracker:
                         fw: int, fh: int) -> None:
         """Predict strike-zone centre & ROI from batter centre."""
         bx, by = bc
-        inp = np.array([bx, by, 1.0])
-        px = int(inp @ self._sx_coeff)
-        py = int(inp @ self._sy_coeff)
+        bc_arr = np.array([bx, by], dtype=np.float64)
+        px, py = self._piecewise_predict(bc_arr)
+        # Apply per-character contact offset
+        px = int(px) + self.contact_offset[0]
+        py = int(py) + self.contact_offset[1]
         self.strike_center_pred = (px, py)
 
         # Interpolate strike-zone size via IDW
@@ -1327,7 +1422,7 @@ class MovementTracker:
                 self.sz_bbox = None
 
 
-#  VISUALISER
+# VISUALISER
 
 class Visualiser:
     """Overlay drawing and debug-panel building."""
@@ -1602,7 +1697,7 @@ class Visualiser:
         return np.vstack(rows)
 
 
-#  FRAME SOURCES
+# FRAME SOURCES
 
 def source_live(fps: int = TARGET_FPS,
                 roi: Tuple[int, int, int, int] = SCREEN_ROI):
@@ -1661,7 +1756,7 @@ def source_video(path: str):
     cap.release()
 
 
-#  MAIN
+# MAIN
 
 def main() -> None:
     ap = argparse.ArgumentParser(

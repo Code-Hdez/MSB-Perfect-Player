@@ -1,18 +1,15 @@
 # Ball Tracking Configuration
 
-# Copy and modify this file.  CLI overrides take precedence.
-# All coordinates are in ROI-relative pixels unless stated otherwise.
-
 [capture]
 screen_roi      = [378, 127, 1542, 1019]   # (left, top, right, bottom) Dolphin window
 monitor_index   = 0
 target_fps      = 60
 
 [detection]
-# HSV thresholds — ball (bright / low saturation)
+# HSV thresholds
 ball_hsv_lower  = [0, 0, 140]
 ball_hsv_upper  = [180, 80, 255]
-# Trail detection — dimmer, motion-blurred ball
+# Trail detection
 trail_hsv_lower = [0, 0, 100]
 trail_hsv_upper = [180, 100, 255]
 
@@ -27,7 +24,7 @@ bg_alpha            = 0.02
 bg_warmup_frames    = 25
 bg_fg_threshold     = 25
 
-# Frame differencing (fallback / secondary)
+# Frame differencing
 diff_threshold      = 25
 diff_dilate_iter    = 2
 
@@ -63,6 +60,41 @@ max_vy_sign_changes     = 2
 # Kalman filter
 kf_process_noise        = 16.0
 kf_measurement_noise    = 4.0
+
+[phase]
+# Game-phase FSM thresholds
+phase_ssim_batter_thresh     = 0.72
+phase_ssim_deviation_thresh  = 0.55
+phase_hysteresis_enter       = 5
+phase_hysteresis_exit        = 8
+phase_ref_thumb_w            = 160
+phase_ref_thumb_h            = 120
+phase_ref_refresh_interval   = 120
+phase_post_swing_lockout_sec = 0.8
+phase_reset_timeout_sec      = 0.5
+phase_min_pitch_vy_trigger   = 40.0
+
+[controller]
+# Swing controller
+ctrl_kp                     = 0.006
+ctrl_kd                     = 0.0015
+ctrl_kff                    = 0.0008
+ctrl_pipeline_latency_sec   = 0.060
+ctrl_swing_startup_sec      = 0.140
+ctrl_swing_hold_sec         = 0.100
+ctrl_swing_window_sec       = 0.060
+ctrl_cooldown_sec           = 0.400
+ctrl_deadzone_px            = 12.0
+
+[metrics]
+# Metrics
+metrics_enabled             = true
+metrics_csv_path            = ""
+metrics_fps_window          = 300
+
+[character]
+contact_offset_x            = 0
+contact_offset_y            = 0
 
 [zones]
 pitcher_zone    = [520, 80, 680, 260]

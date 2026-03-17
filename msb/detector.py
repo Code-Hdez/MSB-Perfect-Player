@@ -18,7 +18,7 @@ from msb.corridor import TrajectoryCorridor
 from msb.utils import crop
 
 
-#  BALL CANDIDATE
+# BALL CANDIDATE
 
 class BallCandidate:
     """One detected blob that might be the ball."""
@@ -47,7 +47,7 @@ class BallCandidate:
                 f"corr={self.corridor_score:.2f}, score={self.score:.2f})")
 
 
-#  BACKGROUND MODEL
+# BACKGROUND MODEL
 
 class BackgroundModel:
     """Running-average background for foreground segmentation."""
@@ -103,7 +103,7 @@ class BackgroundModel:
         self.fg_mask = None
 
 
-#  PITCHER SUPPRESSOR
+# PITCHER SUPPRESSOR
 
 class PitcherSuppressor:
     """Identifies large foreground blobs (pitcher body / arm) and
@@ -162,7 +162,7 @@ class PitcherSuppressor:
             cfg.isolation_outer - cfg.isolation_inner)
 
 
-#  BALL DETECTOR
+# BALL DETECTOR
 
 class BallDetector:
     """Detect the baseball in a game frame.

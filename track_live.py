@@ -142,7 +142,11 @@ def main() -> None:
     scale = cfg.display_scale
 
     try:
-        for frame in src:
+        for item in src:
+            if isinstance(item, tuple):
+                frame, _capture_ts = item
+            else:
+                frame = item
             if frame is None:
                 time.sleep(0.001)
                 continue

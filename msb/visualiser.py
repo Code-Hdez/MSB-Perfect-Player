@@ -22,7 +22,7 @@ from msb.utils import (
 )
 
 
-#  PITCH VISUALISER
+# PITCH VISUALISER
 
 class PitchVisualiser:
     """Draw overlays for ball detection, tracking, and corridor."""
@@ -245,7 +245,7 @@ class PitchVisualiser:
         return np.vstack([row1, row2])
 
 
-#  ROI SELECTOR  (click-to-set search area)
+# ROI SELECTOR
 
 class ROISelector:
     def __init__(self, display_scale: float = 1.0) -> None:
@@ -300,7 +300,7 @@ class ROISelector:
         return vis
 
 
-#  STRIKE-Y SELECTOR
+# STRIKE-Y SELECTOR
 
 class StrikeYSelector:
     def __init__(self, display_scale: float = 1.0) -> None:

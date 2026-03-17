@@ -69,3 +69,6 @@ desktop.ini
 .idea/
 *.suo
 *.user
+
+# Local docs/data snapshots
+dataset/

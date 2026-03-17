@@ -65,6 +65,21 @@ class TrajectoryCorridor:
             return in_rect(x, y, self.rect)
         return True
 
+    def contains_margin(self, x: int, y: int, margin: int = 0) -> bool:
+        """Like contains(), but expands the corridor by *margin* pixels."""
+        if not self.active:
+            return True
+        if self.rect is not None:
+            x1, y1, x2, y2 = self.rect
+            return (x1 - margin <= x <= x2 + margin and
+                    y1 - margin <= y <= y2 + margin)
+        # Polygon: fall back to distance check
+        if self.polygon is not None:
+            d = cv2.pointPolygonTest(
+                self.polygon, (float(x), float(y)), True)
+            return d >= -margin
+        return True
+
     def distance_to_boundary(self, x: int, y: int) -> float:
         """Distance from point to corridor boundary.  Negative = inside."""
         if not self.active:

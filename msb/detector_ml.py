@@ -34,11 +34,10 @@ import numpy as np
 from msb.config import Config
 from msb.corridor import TrajectoryCorridor
 
-# Re-use the shared BallCandidate dataclass
 from msb.detector import BallCandidate
 
 
-#  INFERENCE BACKENDS
+# INFERENCE BACKENDS
 
 class _YOLOBackend:
     """Ultralytics YOLO .pt inference."""
@@ -51,13 +50,14 @@ class _YOLOBackend:
         self._imgsz = imgsz
         self._device = device
 
-    def infer(self, frame: np.ndarray
+    def infer(self, frame: np.ndarray,
+              imgsz: Optional[int] = None
               ) -> List[Tuple[int, int, int, int, float, int]]:
         """Run inference.  Returns list of (x1, y1, x2, y2, conf, cls)."""
         results = self._model.predict(
             frame,
             conf=self._conf,
-            imgsz=self._imgsz,
+            imgsz=imgsz or self._imgsz,
             device=self._device,
             verbose=False,
             stream=False,
@@ -76,10 +76,14 @@ class _YOLOBackend:
 
 
 class _ONNXBackend:
-    """ONNX Runtime inference (no ultralytics dependency at runtime)."""
+    """ONNX Runtime inference (no ultralytics dependency at runtime).
+
+    Automatically tries CUDAExecutionProvider with arena / FP16 opts,
+    falls back to CPU transparently.
+    """
 
     def __init__(self, model_path: str, conf: float,
-                 imgsz: int) -> None:
+                 imgsz: int, fp16: bool = False) -> None:
         try:
             import onnxruntime as ort
         except ImportError:
@@ -87,24 +91,40 @@ class _ONNXBackend:
                   "pip install onnxruntime-gpu  (or onnxruntime)")
             sys.exit(1)
 
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self._sess = ort.InferenceSession(model_path, providers=providers)
+        cuda_opts: Dict = {
+            "arena_extend_strategy": "kSameAsRequested",
+            "cudnn_conv_algo_search": "EXHAUSTIVE",
+        }
+        providers = [
+            ("CUDAExecutionProvider", cuda_opts),
+            "CPUExecutionProvider",
+        ]
+        sess_opts = ort.SessionOptions()
+        sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self._sess = ort.InferenceSession(model_path, sess_opts,
+                                          providers=providers)
+        active = self._sess.get_providers()
+        print(f"[ONNX] Active providers: {active}")
+
         self._conf = conf
         self._imgsz = imgsz
+        self._fp16 = fp16 and ("CUDAExecutionProvider" in active)
         self._input_name = self._sess.get_inputs()[0].name
 
-    def infer(self, frame: np.ndarray
+    def infer(self, frame: np.ndarray,
+              imgsz: Optional[int] = None
               ) -> List[Tuple[int, int, int, int, float, int]]:
         """Preprocess, run ONNX, postprocess NMS."""
-        img, ratio, (pad_w, pad_h) = self._preprocess(frame)
+        img, ratio, (pad_w, pad_h) = self._preprocess(frame, imgsz)
         outputs = self._sess.run(None, {self._input_name: img})
         return self._postprocess(outputs[0], ratio, pad_w, pad_h,
                                  frame.shape[:2])
 
-    def _preprocess(self, frame: np.ndarray):
-        """Letterbox + normalise to NCHW float32."""
+    def _preprocess(self, frame: np.ndarray,
+                    imgsz: Optional[int] = None):
+        """Letterbox + normalise to NCHW float32 (or float16 if fp16)."""
         h0, w0 = frame.shape[:2]
-        sz = self._imgsz
+        sz = imgsz or self._imgsz
         ratio = min(sz / h0, sz / w0)
         new_w, new_h = int(w0 * ratio), int(h0 * ratio)
         img = cv2.resize(frame, (new_w, new_h),
@@ -113,7 +133,8 @@ class _ONNXBackend:
         pad_h = (sz - new_h) // 2
         canvas = np.full((sz, sz, 3), 114, dtype=np.uint8)
         canvas[pad_h:pad_h + new_h, pad_w:pad_w + new_w] = img
-        blob = canvas.astype(np.float32) / 255.0
+        dtype = np.float16 if self._fp16 else np.float32
+        blob = canvas.astype(dtype) / dtype(255.0)
         blob = blob.transpose(2, 0, 1)[np.newaxis, ...]  # NCHW
         return blob, ratio, (pad_w, pad_h)
 
@@ -178,7 +199,7 @@ class _ONNXBackend:
         return keep
 
 
-#  ML BALL DETECTOR  (drop-in replacement for BallDetector)
+# ML BALL DETECTOR
 
 class MLBallDetector:
     """YOLO-based ball detector with the same interface as BallDetector.
@@ -190,7 +211,7 @@ class MLBallDetector:
     conf : float
         Minimum detection confidence (default: 0.25).
     imgsz : int
-        Inference resolution (default: 960). Should match training.
+    Inference resolution (default: 640). Should match training.
     device : str
         "0" for CUDA GPU 0, "cpu" for CPU (only used for .pt backend).
     cfg : Config, optional
@@ -205,7 +226,6 @@ class MLBallDetector:
         device: str = "auto",
         cfg: Optional[Config] = None,
     ) -> None:
-        # Auto-select device: CUDA if available, else CPU
         if device == "auto":
             import torch
             device = "0" if torch.cuda.is_available() else "cpu"
@@ -213,6 +233,7 @@ class MLBallDetector:
         self.model_path = model_path
         self.conf = conf
         self.imgsz = imgsz
+        self._roi_imgsz = max(416, min(imgsz, 512))
 
         # Select backend
         p = Path(model_path)
@@ -226,11 +247,9 @@ class MLBallDetector:
             self._backend = _YOLOBackend(model_path, conf, imgsz, device)
             self._backend_name = "yolo"
 
-        # Public state (same interface as BallDetector)
         self.candidates: List[BallCandidate] = []
         self.best: Optional[BallCandidate] = None
 
-        # Dummy attributes for compatibility with visualiser
         class _DummySuppressor:
             suppression_zones: List = []
             large_blobs: List = []
@@ -250,15 +269,19 @@ class MLBallDetector:
         search_roi: Optional[Tuple[int, int, int, int]] = None,
         corridor: Optional[TrajectoryCorridor] = None,
         track_active: bool = False,
+        track_pos: Optional[Tuple[int, int]] = None,
     ) -> Optional[BallCandidate]:
         """Detect ball in *frame* using YOLO inference.
+
+        When *track_active* and *track_pos* are set, runs inference on a
+        tight ROI crop around the predicted position for lower latency.
+        Falls back to full-frame if nothing is detected in the crop.
 
         Returns the highest-confidence BallCandidate, or None.
         """
         self.candidates.clear()
         self.best = None
 
-        # Generate dummy debug masks (so visualiser doesn't crash)
         h, w = frame.shape[:2]
         empty = np.zeros((h, w), dtype=np.uint8)
         self.bg_fg_mask = empty
@@ -267,16 +290,42 @@ class MLBallDetector:
         self.trail_mask = empty
         self.combined_mask = empty
 
+        # Dynamic ROI
+        roi_offset = (0, 0)
+        infer_frame = frame
+        infer_imgsz = self.imgsz
+        if track_active and track_pos is not None:
+            margin = 240
+            rx1 = max(0, track_pos[0] - margin)
+            ry1 = max(0, track_pos[1] - margin)
+            rx2 = min(w, track_pos[0] + margin)
+            ry2 = min(h, track_pos[1] + margin)
+            crop = frame[ry1:ry2, rx1:rx2]
+            if crop.shape[0] >= 32 and crop.shape[1] >= 32:
+                infer_frame = crop
+                roi_offset = (rx1, ry1)
+                infer_imgsz = self._roi_imgsz
+
         # Run inference
-        raw_dets = self._backend.infer(frame)
+        raw_dets = self._backend.infer(infer_frame, imgsz=infer_imgsz)
+
+        # If ROI crop yielded nothing, retry full frame
+        if not raw_dets and roi_offset != (0, 0):
+            infer_frame = frame
+            roi_offset = (0, 0)
+            raw_dets = self._backend.infer(infer_frame, imgsz=self.imgsz)
 
         if not raw_dets:
             return None
 
         # Convert to BallCandidate objects
+        ox, oy = roi_offset
         for (x1, y1, x2, y2, conf, cls) in raw_dets:
             if cls != 0:  # only class 0 = ball
                 continue
+
+            # Map back to original frame coordinates
+            x1, y1, x2, y2 = x1 + ox, y1 + oy, x2 + ox, y2 + oy
 
             c = BallCandidate()
             bw, bh = x2 - x1, y2 - y1
@@ -285,13 +334,12 @@ class MLBallDetector:
             c.center = (cx, cy)
             c.bbox = (x1, y1, bw, bh)
             c.area = float(bw * bh)
-            c.circularity = 0.8  # YOLO already filtered for ball-ness
+            c.circularity = 0.8
             c.in_motion_mask = True
             c.isolation_score = 1.0
             c.brightness_score = conf
             c.score = conf
 
-            # Corridor scoring (optional secondary filter)
             if corridor is not None:
                 c.corridor_score = corridor.get_corridor_score(cx, cy)
             else:
@@ -307,7 +355,7 @@ class MLBallDetector:
         self.best = self.candidates[0]
         return self.best
 
-    # Rescue detection (simplified for ML)
+    # Rescue detection
 
     def rescue_near(
         self, centre: Tuple[int, int], radius: int = 50,
@@ -322,7 +370,7 @@ class MLBallDetector:
         # The tracker handles gaps via Kalman prediction
         return None
 
-    # Reset (compatibility)
+    # Reset
 
     def reset(self) -> None:
         self.candidates.clear()

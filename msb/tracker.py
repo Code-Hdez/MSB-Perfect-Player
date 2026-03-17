@@ -22,7 +22,7 @@ from msb.detector import BallCandidate, BallDetector
 from msb.utils import in_rect
 
 
-#  TRACK STATE
+# TRACK STATE
 
 class TrackState(Enum):
     IDLE = auto()
@@ -31,7 +31,7 @@ class TrackState(Enum):
     LOST = auto()
 
 
-#  BALL TRACK  (single tracked object)
+# BALL TRACK
 
 class BallTrack:
     """Ball state tracked across frames with a Kalman filter.
@@ -232,7 +232,7 @@ class BallTrack:
 TrackedBall = BallTrack
 
 
-#  BALL TRACKER  (lifecycle management)
+# BALL TRACKER
 
 class BallTracker:
     """Track the pitched ball across frames.
